@@ -16,5 +16,8 @@ otherwise.
 | `cai-ollama/` | CAI + local-Ollama config bugs (keep-alive, dotenv, model precedence) and the wrapper that works around them |
 | `clawhub-taxonomy/` | Embedding + clustering pipeline for building a real category system over 70K+ unlabeled items |
 | `forum-dl-vbulletin-fix/` | Patch for a forum-dl crash against vBulletin sites with no `&lt;base&gt;` tag |
+| `gpu-status/` | Cross-checks nvidia-smi against Ollama/LM Studio to catch VRAM contention neither tool reports on its own |
+| `ble-fingerprint/` | Identify a BLE device via host-side scan + GATT enumeration, beyond just its broadcast name |
+| `hf-model-vetting/` | Data-gathering script + checklist for telling a real HuggingFace model release from a spam/rebrand repo |
 
 More added case-by-case as work is captured.
