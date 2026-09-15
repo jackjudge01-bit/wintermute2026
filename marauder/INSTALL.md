@@ -66,6 +66,7 @@ python3 marauder_probe.py       # connectivity check (no side effects)
 python3 marauder_probe2.py      # protocolinfo / gps / settings queries
 python3 marauder_probe3.py      # list formats + a short live scanall
 python3 marauder_info.py         # full scan (~14 s) then per-AP info dump
+python3 esp32_bt_sweep.py        # BLE sweep (~25s), unique devices by RSSI
 ```
 
 `marauder_probe3.py` and `marauder_info.py` run a real `scanall` (~15 s)

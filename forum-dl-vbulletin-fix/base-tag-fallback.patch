@@ -1,0 +1,16 @@
+diff --git a/forum_dl/extractors/vbulletin.py b/forum_dl/extractors/vbulletin.py
+index fb69f29..4475454 100644
+--- a/forum_dl/extractors/vbulletin.py
++++ b/forum_dl/extractors/vbulletin.py
+@@ -229,8 +229,9 @@ class VbulletinExtractor(HtmlExtractor):
+         if not generator_meta.get("content").startswith("vBulletin"):
+             return None
+ 
+-        base = soup.find("base")
+-        return VbulletinExtractor(session, base.get("href"), options)
++        base = soup.try_find("base")
++        base_url = base.get("href") if base else urljoin(response.url, "/")
++        return VbulletinExtractor(session, base_url, options)
+ 
+     def _fetch_top_boards(self):
+         self._are_subboards_fetched[self.root.path] = True

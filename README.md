@@ -13,5 +13,8 @@ otherwise.
 | `devicedb/` | Unified BT/Wi-Fi/LAN device inventory (SQLite + collectors) |
 | `marauder/` | ESP32 Marauder serial-CLI protocol probes (pyserial) |
 | `ollama-benchmarks/` | Local-LLM benchmark probes (thinking tax, prefill vs ctx, sampler bisects) |
+| `cai-ollama/` | CAI + local-Ollama config bugs (keep-alive, dotenv, model precedence) and the wrapper that works around them |
+| `clawhub-taxonomy/` | Embedding + clustering pipeline for building a real category system over 70K+ unlabeled items |
+| `forum-dl-vbulletin-fix/` | Patch for a forum-dl crash against vBulletin sites with no `&lt;base&gt;` tag |
 
 More added case-by-case as work is captured.

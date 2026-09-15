@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Wrapper for CAI so the model actually stays pinned to what you set here,
+# instead of silently falling back to whatever /etc/profile.d/cai.sh exports.
+#
+# Default is the uncensored Venice model (same one OpenClaw/Vesper runs on).
+# Usage:
+#   cai-run                                  -> Venice GLM 4.7 Flash Heretic (uncensored)
+#   cai-run ollama/<model>                   -> any local Ollama model
+#   cai-run openai/<venice-model-id> [agent] -> any Venice model
+set -euo pipefail
+
+DEFAULT_MODEL="openai/olafangensan-glm-4.7-flash-heretic"
+DEFAULT_AGENT="redteam_agent"
+
+CAI_MODEL="${1:-$DEFAULT_MODEL}"
+CAI_AGENT_TYPE="${2:-$DEFAULT_AGENT}"
+
+export CAI_MODEL
+export CAI_AGENT_TYPE
+
+# Local Ollama (still available: `cai-run ollama/<model>`)
+export OLLAMA_API_BASE="http://127.0.0.1:11434"
+
+# Venice: OpenAI-compatible endpoint. LiteLLM routes `openai/<model>` to
+# OPENAI_API_BASE, so a Venice model id works with the openai/ prefix.
+export OPENAI_API_BASE="https://api.venice.ai/api/v1"
+export OPENAI_BASE_URL="https://api.venice.ai/api/v1"
+if [ -f "$HOME/.venice_api_key" ]; then
+  OPENAI_API_KEY="$(tr -d '\n' < "$HOME/.venice_api_key")"
+fi
+export OPENAI_API_KEY
+
+export PROMPT_TOOLKIT_NO_CPR=1
+export CAI_STREAM=false
+
+echo "[cai-run] model=${CAI_MODEL} agent=${CAI_AGENT_TYPE} endpoint=${OPENAI_API_BASE}" >&2
+
+source "$HOME/cai-venv/bin/activate"
+
+# Anything past the first two args is forwarded to CAI as an initial prompt,
+# so `cai-run <model> <agent> "do the thing"` runs one-shot then drops to the REPL.
+if [ "$#" -gt 2 ]; then
+  shift 2
+  exec cai "$@"
+fi
+exec cai
