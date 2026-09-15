@@ -93,6 +93,29 @@ agents, batch classification), prefer a non-reasoning model or confirm
 `"think": false` actually suppresses it for your specific model+client
 combination before committing to it at scale.
 
+## Bug 6 — CAI crashes logging cost after a tool-call turn against some providers
+
+Symptom: after a turn that used tools, CAI throws mid-session and drops
+back to a broken prompt state:
+```
+TypeError: float() argument must be a string or a real number, not 'dict'
+```
+with the traceback bottoming out in `cai/sdk/agents/run_to_jsonl.py`,
+`rec_training_data()`, at `interaction_cost = float(msg.cost)`.
+
+Root cause: CAI's usage-logging code assumes every provider's response
+carries `cost` as a plain number. At least one OpenAI-compatible provider
+(Venice) returns a structured dict for `cost` instead (e.g. breaking down
+input/output cost separately) — `float()` on a dict raises immediately,
+crashing the whole turn's logging path (and, with it, the turn itself).
+
+This is a bug in CAI's own SDK code, not something fixable from the
+outside via config or env vars like Bugs 1-3. Workaround until patched
+upstream: providers/models confirmed to return a plain numeric `cost` (the
+default free/local Ollama path always does, since local cost is always
+`0.0`) don't trigger this at all — it's specifically cloud providers with
+richer cost-reporting structures that risk it.
+
 ## `cai-run`
 
 Sets every CAI-relevant env var explicitly and `exec`s `cai`, so none of
