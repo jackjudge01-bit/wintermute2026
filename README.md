@@ -11,5 +11,7 @@ otherwise.
 |---|---|
 | `hackrf/` | Live FM demodulation monitor for the HackRF One SDR |
 | `devicedb/` | Unified BT/Wi-Fi/LAN device inventory (SQLite + collectors) |
+| `marauder/` | ESP32 Marauder serial-CLI protocol probes (pyserial) |
+| `ollama-benchmarks/` | Local-LLM benchmark probes (thinking tax, prefill vs ctx, sampler bisects) |
 
 More added case-by-case as work is captured.
