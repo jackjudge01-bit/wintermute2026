@@ -19,5 +19,6 @@ otherwise.
 | `gpu-status/` | Cross-checks nvidia-smi against Ollama/LM Studio to catch VRAM contention neither tool reports on its own |
 | `ble-fingerprint/` | Identify a BLE device via host-side scan + GATT enumeration, beyond just its broadcast name |
 | `hf-model-vetting/` | Data-gathering script + checklist for telling a real HuggingFace model release from a spam/rebrand repo |
+| `openclaw-subagents/` | OpenClaw multi-agent routing bugs — two wrong fixes tried before the real one (a `bindings` entry, not `default:true` or `systemAgent`), plus real VRAM and thinking-level findings |
 
 More added case-by-case as work is captured.
