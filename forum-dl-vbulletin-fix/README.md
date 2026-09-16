@@ -1,4 +1,4 @@
-# forum-dl vBulletin `&lt;base&gt;` tag crash fix
+# forum-dl vBulletin `<base>` tag crash fix
 
 [`forum-dl`](https://github.com/mikwielgus/forum-dl) (a generic
 forum-to-mailbox archiver, similar in spirit to `gallery-dl`) fails to
