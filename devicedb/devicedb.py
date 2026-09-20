@@ -1013,11 +1013,14 @@ def contribute(conn, since="1h", limit=500):
         obs_id, ts, source, mac, ip, kind, name, rssi, channel, extra_s, place, lat, lon = r
         extra = json.loads(extra_s) if extra_s else {}
         vendor = extra.get("vendor")
+        # ts is stored UTC but naive ("%Y-%m-%dT%H:%M:%S"); append the UTC
+        # offset if absent so Kibana's time picker can filter it.
+        observed = ts if (ts and re.search(r"[Zz]|[+-]\d{2}:?\d{2}$", ts)) else f"{ts}+00:00"
         doc = {
             "obs_id": obs_id,
             "contributor": ES_CONTRIBUTOR,
             "signal": source,
-            "observed_at": ts,
+            "observed_at": observed,
             "received_at": datetime.now(timezone.utc).isoformat(),
             "mac_hash": hashlib.sha256((mac or "").encode()).hexdigest() if mac else None,
             "name": name,

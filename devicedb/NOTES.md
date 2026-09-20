@@ -331,3 +331,13 @@ Captured as stated; user still dictating.
   ES 9.5.4 (:9200) + Kibana (:5601) are the live store/analysis layer.
 - **ES boot fix:** /usr/share/elasticsearch/{logs,data} were missing (AccessDenied
   on boot). Created + chowned to elasticsearch:elasticsearch.
+
+## 2026-09-20 — observed_at timezone fix + Kibana data views
+
+- **observed_at was naive UTC** (no tz offset), so Kibana's time picker
+  couldn't filter and Discover showed nothing. Patched devicedb.py to append
+  a UTC offset to observed_at (regex guard: only append if no tz already
+  present). Values are now timezone-aware; new observations filter correctly.
+- **Kibana data views** (created via Kibana API, old broken view deleted):
+  - `devicedb-obs` — timeFieldName `received_at`
+  - `devicedb-obs-observed` — timeFieldName `observed_at`

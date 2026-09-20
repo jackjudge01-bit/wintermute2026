@@ -16,3 +16,11 @@
   kept for reference. The projection cron was removed.
 - **Future:** this is the natural home for the RF data project (ES index for
   RF captures + signal analysis), alongside the device data.
+
+## 2026-09-20 — Kibana data views on the ES store
+
+- Two Kibana data views now exist over index `devicedb-obs-000001`:
+  `devicedb-obs` (timeFieldName `received_at`) and `devicedb-obs-observed`
+  (timeFieldName `observed_at`). The old view broke because observed_at was
+  naive UTC; devicedb now writes tz-aware timestamps. Kibana Discover time
+  filtering works against both fields.
