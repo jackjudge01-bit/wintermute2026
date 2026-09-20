@@ -1,0 +1,5 @@
+inventory.db
+inventory.db-*
+__pycache__/
+logs/
+raw/
