@@ -1,7 +1,7 @@
 #!/bin/bash
 # devicedb auto-pilot sweep. Installed by cron every 15 min.
 # Stop with: crontab -e   (comment out the devicedb line)
-cd "$(dirname "$0")" || exit 1
+cd /path/to/devicedb || exit 1
 mkdir -p logs
 L=logs/sweep-$(date +%Y%m).log
 {
@@ -10,7 +10,10 @@ L=logs/sweep-$(date +%Y%m).log
   timeout 300 python3 devicedb.py sweep \
       --arpwatch --arp --ble \
       --marauder-seconds 15 --marauder-ble-seconds 10
-  echo "exit=$?"
+  echo "sweep exit=$?"
+  # push new observations to central (Postgres -> ES read model)
+  timeout 60 python3 devicedb.py contribute --since 1h
+  echo "contribute exit=$?"
 } >> "$L" 2>&1
 
 # keep logs to ~2 months

@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS devices (
     last_seen   TEXT NOT NULL,
     source      TEXT,                   -- csv of sources that observed it
     randomized  INTEGER DEFAULT 0,      -- locally-administered MAC (privacy)
+    place       TEXT,                   -- where the sweep that saw it ran
+    lat         REAL,
+    lon         REAL,
     notes       TEXT
 );
 
@@ -28,7 +31,25 @@ CREATE TABLE IF NOT EXISTS observations (
     rssi     INTEGER,
     channel  TEXT,
     extra    TEXT,                      -- JSON blob
-    run_id   INTEGER REFERENCES runs(run_id)
+    run_id   INTEGER REFERENCES runs(run_id),
+    place    TEXT,                      -- location at time of sighting
+    lat      REAL,
+    lon      REAL,
+    device_id INTEGER                   -- device cluster this sighting belongs to
+);
+
+-- Observed MACs -> device cluster. The device-centric core: a physical device
+-- that rotates its MAC (BLE, mobile) maps to ONE device_id across all its MACs.
+CREATE TABLE IF NOT EXISTS identities (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  INTEGER NOT NULL REFERENCES devices(device_id),
+    mac        TEXT,
+    name       TEXT,
+    mfr_data   TEXT,                    -- manufacturer-data fingerprint (JSON)
+    first_seen TEXT,
+    last_seen  TEXT,
+    source     TEXT,
+    UNIQUE(device_id, mac)
 );
 
 -- Open ports / services seen on a host.
@@ -53,7 +74,8 @@ CREATE TABLE IF NOT EXISTS runs (
     status     TEXT,                    -- running|ok|error
     records    INTEGER DEFAULT 0,
     artifact   TEXT,                    -- path to raw output kept in raw/
-    error      TEXT
+    error      TEXT,
+    place      TEXT                     -- where this run's sweep ran
 );
 
 CREATE INDEX IF NOT EXISTS idx_devices_mac      ON devices(mac);
@@ -76,6 +98,7 @@ SELECT
     d.first_seen,
     d.last_seen,
     (SELECT COUNT(*) FROM observations o WHERE o.mac = d.mac) AS obs_count,
+    (SELECT COUNT(*) FROM identities i WHERE i.device_id = d.device_id) AS alias_count,
     (SELECT COUNT(*) FROM services s WHERE s.ip = d.ip)       AS port_count
 FROM devices d
 ORDER BY d.last_seen DESC;

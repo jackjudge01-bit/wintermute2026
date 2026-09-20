@@ -4,8 +4,8 @@ Passive + active device collection on the Kali laptop, all sources merged into
 one SQLite database (`inventory.db`) that you can query at leisure. Runs on
 cron ("auto-pilot") so history accumulates without you driving it.
 
-Location: repo root
-Database: `./inventory.db`
+Location: `/path/to/devicedb/`
+Database: `/path/to/devicedb/inventory.db`
 
 ---
 
@@ -172,7 +172,7 @@ python3 devicedb.py ingest-zeek  <logdir>
 
 ## 6. Auto-pilot
 
-`./sweep.sh` runs a full sweep and appends to
+`/path/to/devicedb/sweep.sh` runs a full sweep and appends to
 `logs/sweep-YYYYMM.log` (logs pruned after 60 days). Installed in the user
 crontab:
 

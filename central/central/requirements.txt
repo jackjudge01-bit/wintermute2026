@@ -1,8 +1,0 @@
-# ~/central/venv dependencies
-fastapi
-uvicorn[standard]
-psycopg[binary]
-# reporting
-reportlab
-pypdf
-pdfplumber

@@ -314,3 +314,20 @@ Captured as stated; user still dictating.
 
 
 
+
+## ES ingest wired (2026-09-20)
+
+- **Decision:** devicedb writes observations DIRECTLY to Elasticsearch. No
+  Postgres, no central FastAPI in the ingest path. Device/location histories
+  are built later in post-processing (Jack's call — ES-first, enrich later).
+- **`contribute` subcommand** added to devicedb.py: bulk-indexes recent local
+  observations to ES index `devicedb-obs-000001`, `_id` = local `obs_id`
+  (idempotent create-or-replace — re-pushing the same observation overwrites,
+  no collisions). Env: ES_URL, ES_INDEX, ES_CONTRIBUTOR.
+- **Cron:** `*/10 sweep.sh` now runs `contribute --since 1h` after each sweep.
+  The old central projection cron was removed.
+- **Verified:** 478 docs in ES, max obs_id matches local DB (25067).
+- **Parked:** central FastAPI (:8090) + Postgres 18 — no longer in the path.
+  ES 9.5.4 (:9200) + Kibana (:5601) are the live store/analysis layer.
+- **ES boot fix:** /usr/share/elasticsearch/{logs,data} were missing (AccessDenied
+  on boot). Created + chowned to elasticsearch:elasticsearch.

@@ -2,7 +2,7 @@
 """Build the project PDF report from a spec dict."""
 import sys
 
-sys.path.insert(0, "/path/to/pdf-skill/scripts")
+sys.path.insert(0, "/path/to/.hermes/skills/productivity/pdf/scripts")
 from pdf_create import build_pdf  # noqa: E402
 
 E = []
@@ -300,7 +300,7 @@ spec = {
     "elements": E,
 }
 
-out = "/path/to/central/device-tracker-report.pdf"
+out = "/path/to/central/device-tracker-report-2026-09-17.pdf"
 rc = build_pdf(spec, out)
 print("build_pdf rc:", rc)
 print("out:", out)

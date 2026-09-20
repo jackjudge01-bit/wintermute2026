@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -38,6 +39,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
@@ -122,7 +124,66 @@ def get_db():
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")   # wait for the cron sweep's write lock
+    _ensure_location_cols(conn)
+    _ensure_cluster_schema(conn)
     return conn
+
+
+def _ensure_location_cols(conn):
+    """Add the location columns to existing DBs (idempotent)."""
+    for tbl, col, decl in [
+        ("devices", "place", "TEXT"),
+        ("devices", "lat", "REAL"),
+        ("devices", "lon", "REAL"),
+        ("observations", "place", "TEXT"),
+        ("observations", "lat", "REAL"),
+        ("observations", "lon", "REAL"),
+        ("runs", "place", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # column already present
+
+
+def _ensure_cluster_schema(conn):
+    """Create the device-cluster tables + one-time migration: `identities`
+    (observed MACs -> device cluster) and observations.device_id."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS identities (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id INTEGER NOT NULL REFERENCES devices(device_id),
+        mac TEXT,
+        name TEXT,
+        mfr_data TEXT,
+        first_seen TEXT,
+        last_seen TEXT,
+        source TEXT,
+        UNIQUE(device_id, mac)
+    )""")
+    try:
+        conn.execute("ALTER TABLE observations ADD COLUMN device_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    if conn.execute("SELECT COUNT(*) AS n FROM identities").fetchone()["n"] == 0:
+        conn.execute(
+            """INSERT OR IGNORE INTO identities (device_id, mac, name, first_seen, last_seen, source)
+               SELECT device_id, mac, hostname, first_seen, last_seen, source
+                 FROM devices WHERE mac IS NOT NULL AND mac != ''""")
+        conn.execute(
+            """UPDATE observations SET device_id = (
+                   SELECT device_id FROM identities i
+                    WHERE i.mac = observations.mac LIMIT 1)
+                WHERE device_id IS NULL AND mac IS NOT NULL""")
+    # backfill names on identities from the device row (one-time; no-op once done)
+    if conn.execute(
+        "SELECT COUNT(*) FROM identities WHERE name IS NULL"
+    ).fetchone()[0] > 0:
+        conn.execute(
+            """UPDATE identities SET name = (
+                   SELECT hostname FROM devices d WHERE d.device_id = identities.device_id)
+                WHERE name IS NULL""")
+    conn.commit()
 
 
 def init_db():
@@ -138,12 +199,102 @@ def init_db():
 
 # ---------------------------------------------------------------- writes
 
-def upsert_device(conn, mac=None, ip=None, hostname=None, kind=None,
-                  name=None, ts=None, source=None):
-    """Create or update a device row. Matches on MAC if present, else IP."""
+def _mfr_signature(mfr_data):
+    try:
+        return json.dumps(mfr_data, sort_keys=True) if mfr_data else None
+    except Exception:
+        return None
+
+
+def _ensure_identity(conn, device_id, mac, name=None, mfr_data=None, source=None, ts=None):
+    """Record an observed MAC as an alias of a device cluster (the device-centric core)."""
     ts = ts or now_iso()
     mac = norm_mac(mac) if mac else None
+    if not mac or not device_id:
+        return
+    r = conn.execute("SELECT id FROM identities WHERE device_id=? AND mac=?",
+                     (device_id, mac)).fetchone()
+    if r:
+        conn.execute("UPDATE identities SET last_seen=?, source=?, name=COALESCE(?,name) "
+                     "WHERE id=?",
+                     (ts, source, name, r["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO identities (device_id, mac, name, mfr_data, first_seen, "
+            "last_seen, source) VALUES (?,?,?,?,?,?,?)",
+            (device_id, mac, name, _mfr_signature(mfr_data), ts, ts, source))
 
+
+def find_cluster(conn, mac=None, name=None, mfr_data=None):
+    """Resolve a device cluster for a sighting. Conservative: alias by MAC first,
+    then merge only on a strong unambiguous fingerprint (BLE name + mfr data, or a
+    name owned by exactly one existing device). Returns device_id or None."""
+    if mac:
+        r = conn.execute("SELECT device_id FROM identities WHERE mac=?",
+                         (norm_mac(mac),)).fetchone()
+        if r:
+            return r["device_id"]
+    sig = _mfr_signature(mfr_data)
+    if name and sig:
+        r = conn.execute(
+            "SELECT device_id FROM identities WHERE name=? AND mfr_data=? LIMIT 1",
+            (name, sig)).fetchone()
+        if r:
+            return r["device_id"]
+    if name:
+        rows = conn.execute(
+            "SELECT DISTINCT device_id FROM identities WHERE name=?", (name,)).fetchall()
+        if len(rows) == 1:          # unambiguous
+            return rows[0]["device_id"]
+    return None
+
+
+def upsert_device(conn, mac=None, ip=None, hostname=None, kind=None,
+                  name=None, ts=None, source=None, mfr_data=None):
+    """Device-centric: BLE devices (which rotate MACs) cluster into one stable
+    synthetic device_id; every observed MAC is rejoined under it in `identities`.
+    Non-BLE (APs, wired) keep MAC/IP as their identity (stable addresses)."""
+    ts = ts or now_iso()
+    mac = norm_mac(mac) if mac else None
+    loc = resolve_location()
+
+    # --- BLE: cluster across rotating MACs -------------------------------
+    if kind == "ble":
+        did = find_cluster(conn, mac=mac, name=name, mfr_data=mfr_data)
+        if did is None:
+            srcs = source or ""
+            conn.execute(
+                """INSERT INTO devices (mac, ip, hostname, vendor, kinds, first_seen,
+                                        last_seen, source, randomized, place)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (mac, ip, hostname or name, vendor_for(mac), "ble", ts, ts, srcs,
+                 1 if (mac and is_local_mac(mac)) else 0, loc["place"]))
+            did = conn.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
+        else:
+            row = conn.execute("SELECT * FROM devices WHERE device_id=?",
+                               (did,)).fetchone()
+            kinds = set(filter(None, (row["kinds"] or "").split(",")))
+            kinds.add("ble")
+            srcs = set(filter(None, (row["source"] or "").split(",")))
+            if source:
+                srcs.add(source)
+            conn.execute(
+                """UPDATE devices
+                      SET ip       = COALESCE(?, ip),
+                          hostname = COALESCE(?, hostname),
+                          vendor   = COALESCE(?, vendor),
+                          kinds    = ?,
+                          source   = ?,
+                          last_seen= ?,
+                          place    = COALESCE(?, place)
+                    WHERE device_id = ?""",
+                (ip, hostname, vendor_for(mac), ",".join(sorted(kinds)),
+                 ",".join(sorted(srcs)), ts, loc["place"], did))
+        _ensure_identity(conn, did, mac, name=name, mfr_data=mfr_data,
+                         source=source, ts=ts)
+        return did
+
+    # --- non-BLE: MAC/IP is the identity (APs, wired hosts) ---------------
     row = None
     if mac:
         row = conn.execute("SELECT * FROM devices WHERE mac=?", (mac,)).fetchone()
@@ -157,10 +308,10 @@ def upsert_device(conn, mac=None, ip=None, hostname=None, kind=None,
         srcs = source or ""
         conn.execute(
             """INSERT INTO devices (mac, ip, hostname, vendor, kinds, first_seen,
-                                    last_seen, source, randomized)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+                                    last_seen, source, randomized, place)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (mac, ip, hostname or name, vendor_for(mac), kinds, ts, ts, srcs,
-             1 if (mac and is_local_mac(mac)) else 0),
+             1 if (mac and is_local_mac(mac)) else 0, loc["place"]),
         )
         return conn.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
 
@@ -173,27 +324,33 @@ def upsert_device(conn, mac=None, ip=None, hostname=None, kind=None,
         srcs.add(source)
     conn.execute(
         """UPDATE devices
-             SET ip       = COALESCE(?, ip),
-                 hostname = COALESCE(?, hostname),
-                 vendor   = COALESCE(?, vendor),
-                 kinds    = ?,
-                 source   = ?,
-                 last_seen= ?
-           WHERE device_id = ?""",
-        (ip, hostname, vendor_for(mac), ",".join(sorted(kinds)),
-         ",".join(sorted(srcs)), ts, did),
+                    SET ip       = COALESCE(?, ip),
+                        hostname = COALESCE(?, hostname),
+                        vendor   = COALESCE(?, vendor),
+                        kinds    = ?,
+                        source   = ?,
+                        last_seen= ?,
+                        place    = COALESCE(?, place)
+                  WHERE device_id = ?""",
+                (ip, hostname, vendor_for(mac), ",".join(sorted(kinds)),
+                 ",".join(sorted(srcs)), ts, loc["place"], did),
     )
+    _ensure_identity(conn, did, mac, name=name, mfr_data=mfr_data,
+                     source=source, ts=ts)
     return did
 
 
 def add_observation(conn, mac=None, ip=None, kind=None, name=None, rssi=None,
                     channel=None, extra=None, source=None, ts=None, run_id=None):
+    loc = resolve_location()
+    did = find_cluster(conn, mac=mac, name=name) if mac else None
     conn.execute(
         """INSERT INTO observations (ts, source, mac, ip, kind, name, rssi,
-                                     channel, extra, run_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                                     channel, extra, run_id, place, lat, lon, device_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (ts or now_iso(), source, norm_mac(mac) if mac else None, ip, kind,
-         name, rssi, channel, json.dumps(extra) if extra else None, run_id),
+         name, rssi, channel, json.dumps(extra) if extra else None, run_id,
+         loc["place"], loc["lat"], loc["lon"], did),
     )
 
 
@@ -211,8 +368,10 @@ def upsert_service(conn, ip, port, proto, service=None, banner=None, ts=None):
 
 
 def start_run(conn, tool, args=None):
-    conn.execute("INSERT INTO runs (started_at, tool, args, status) VALUES (?,?,?,'running')",
-                 (now_iso(), tool, args))
+    loc = resolve_location()
+    conn.execute("INSERT INTO runs (started_at, tool, args, status, place) "
+                 "VALUES (?,?,?,'running',?)",
+                 (now_iso(), tool, args, loc["place"]))
     return conn.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
 
 
@@ -222,6 +381,67 @@ def finish_run(conn, run_id, status="ok", records=0, artifact=None, error=None):
            WHERE run_id=?""",
         (now_iso(), status, records, artifact, error, run_id),
     )
+
+
+# ---------------------------------------------------------------- location
+
+_CURRENT_LOC = {"place": None, "lat": None, "lon": None, "method": None, "ip": None}
+
+def _resolve_gps():
+    """Try a GPS device via gpsd (gpspipe). Returns {lat,lon} or None."""
+    try:
+        import subprocess
+        p = subprocess.run(["gpspipe", "-w", "-n", "8"], capture_output=True,
+                           text=True, timeout=3)
+        for line in p.stdout.splitlines():
+            try:
+                d = json.loads(line)
+                if d.get("class") == "TPV" and d.get("lat") and d.get("lon"):
+                    return {"lat": d["lat"], "lon": d["lon"]}
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+def _resolve_geoip():
+    """Public-IP geolocation via ip-api.com (free, no key). Returns loc dict or None."""
+    import urllib.request
+    try:
+        ip = urllib.request.urlopen("https://api.ipify.org", timeout=8).read().decode().strip()
+    except Exception:
+        return None
+    try:
+        url = (f"http://ip-api.com/json/{ip}?fields=status,lat,lon,city,"
+               f"regionName,country,query,isp")
+        d = json.loads(urllib.request.urlopen(url, timeout=8).read().decode())
+        if d.get("status") == "success":
+            place = ", ".join(x for x in (d.get("city"), d.get("regionName"),
+                                          d.get("country")) if x)
+            return {"lat": d["lat"], "lon": d["lon"], "place": place,
+                    "ip": d.get("query")}
+    except Exception:
+        pass
+    return None
+
+def resolve_location(refresh=False):
+    """Resolve current location once per sweep: GPS device, else public-IP geo."""
+    global _CURRENT_LOC
+    if _CURRENT_LOC["method"] and not refresh:
+        return _CURRENT_LOC
+    g = _resolve_gps()
+    if g:
+        _CURRENT_LOC = {"lat": g["lat"], "lon": g["lon"], "place": "gps",
+                        "method": "gps", "ip": None}
+        return _CURRENT_LOC
+    gi = _resolve_geoip()
+    if gi:
+        _CURRENT_LOC = {"place": gi["place"], "lat": gi["lat"], "lon": gi["lon"],
+                        "method": "geoip", "ip": gi["ip"]}
+    else:
+        _CURRENT_LOC = {"place": None, "lat": None, "lon": None,
+                        "method": "none", "ip": None}
+    return _CURRENT_LOC
 
 
 # ---------------------------------------------------------------- ingesters
@@ -237,7 +457,8 @@ def ingest_blea(conn, path_or_obj, run_id=None):
         mac = dev.get("identifier")
         name = dev.get("name") or dev.get("local_name")
         rssi = dev.get("rssi")
-        upsert_device(conn, mac=mac, kind="ble", name=name, ts=ts, source="blea")
+        upsert_device(conn, mac=mac, kind="ble", name=name, ts=ts, source="blea",
+                      mfr_data=dev.get("manufacturer_data"))
         add_observation(conn, mac=mac, kind="ble", name=name, rssi=rssi,
                         source="blea", ts=ts, run_id=run_id,
                         extra={"service_uuids": dev.get("service_uuids"),
@@ -650,6 +871,7 @@ def run_cmd(cmd, timeout=300):
 def sweep(args):
     conn = get_db()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    resolve_location(refresh=True)   # stamp current location once per sweep
     results = {}
 
     # 1. BLE (Bluetooth Low Energy) via BLEA
@@ -753,10 +975,80 @@ def sweep(args):
         results["kismet"] = n
 
     conn.commit()
-    print(json.dumps({"sweep": stamp, "results": results}, indent=2))
+    loc = resolve_location()
+    print(json.dumps({"sweep": stamp, "location": loc, "results": results}, indent=2))
     conn.close()
 
 
+# ---------------------------------------------------------------- contribute
+
+ES_URL = os.environ.get("ES_URL", "http://127.0.0.1:9200")
+ES_INDEX = os.environ.get("ES_INDEX", "devicedb-obs-000001")
+ES_CONTRIBUTOR = os.environ.get("ES_CONTRIBUTOR", "wintermute")
+
+
+def contribute(conn, since="1h", limit=500):
+    """Push recent local observations directly to Elasticsearch.
+
+    Each doc uses the local obs_id as its ES _id, so re-pushing the same
+    observation is an idempotent create-or-replace (no collisions). Device
+    and location histories are built later in post-processing.
+    """
+    since_ts = parse_since(since)
+    rows = conn.execute(
+        """SELECT obs_id, ts, source, mac, ip, kind, name, rssi, channel, extra,
+                  place, lat, lon
+             FROM observations
+            WHERE ts >= ?
+            ORDER BY ts
+            LIMIT ?""",
+        (since_ts, limit),
+    ).fetchall()
+    if not rows:
+        print(json.dumps({"contributed": 0, "skipped": "no observations in window"}))
+        return
+
+    lines = []
+    for r in rows:
+        obs_id, ts, source, mac, ip, kind, name, rssi, channel, extra_s, place, lat, lon = r
+        extra = json.loads(extra_s) if extra_s else {}
+        vendor = extra.get("vendor")
+        doc = {
+            "obs_id": obs_id,
+            "contributor": ES_CONTRIBUTOR,
+            "signal": source,
+            "observed_at": ts,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "mac_hash": hashlib.sha256((mac or "").encode()).hexdigest() if mac else None,
+            "name": name,
+            "rssi": rssi,
+            "channel": channel,
+            "vendor": vendor,
+            "place": place,
+            "fingerprint": None,
+            "extra": extra,
+        }
+        if lat is not None and lon is not None:
+            doc["location"] = {"lat": lat, "lon": lon}
+        lines.append(json.dumps({"index": {"_index": ES_INDEX, "_id": obs_id}}))
+        lines.append(json.dumps(doc))
+
+    body = ("\n".join(lines) + "\n").encode()
+    req = urllib.request.Request(
+        f"{ES_URL}/_bulk?refresh=false", data=body, method="POST",
+        headers={"Content-Type": "application/x-ndjson"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            out = json.loads(resp.read())
+        errs = sum(1 for i in out.get("items", []) if i["index"].get("error"))
+        print(json.dumps({"contributed": len(rows), "errors": errs,
+                          "took_ms": out.get("took")}, indent=2))
+    except Exception as e:
+        print(json.dumps({"contributed": 0, "error": str(e)}))
+
+
+#n
 # ---------------------------------------------------------------- queries
 
 def parse_since(s):
@@ -884,6 +1176,26 @@ def q_runs(conn, a):
 
 # ---------------------------------------------------------------- main
 
+def q_cluster(conn, a):
+    """Report device clusters — physical devices seen under multiple MACs."""
+    rows = conn.execute("""
+        SELECT d.device_id, d.mac AS rep_mac, d.hostname AS name, d.vendor, d.kinds,
+               COUNT(i.id) AS aliases, MIN(i.first_seen) AS first, MAX(i.last_seen) AS last
+          FROM devices d
+          LEFT JOIN identities i ON i.device_id = d.device_id
+         GROUP BY d.device_id
+         HAVING aliases > 1
+         ORDER BY aliases DESC LIMIT ?""", (a.limit,)).fetchall()
+    if not rows:
+        print("no multi-MAC clusters yet (BLE devices rotate MACs; clusters appear as they do)")
+    for r in rows:
+        print(f"device {r['device_id']:>5} | {r['aliases']:>3} MACs | rep {r['rep_mac'] or '-':18} "
+              f"| {r['name'] or '-':20} | {r['vendor'] or '-':20} | {r['kinds'] or '-'}")
+    tot = conn.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"]
+    ali = conn.execute("SELECT COUNT(*) AS n FROM identities").fetchone()["n"]
+    print(f"\ntotal devices={tot}   observed MACs (identities)={ali}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="unified device inventory")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -916,6 +1228,10 @@ def main():
     p.add_argument("--ble-seconds", type=int, default=12)
     sub.add_parser("refresh-vendors")
 
+    c = sub.add_parser("contribute")
+    c.add_argument("--since", default="1h")
+    c.add_argument("--limit", type=int, default=500)
+
     p = sub.add_parser("ingest-blea"); p.add_argument("path")
     p = sub.add_parser("ingest-kismet"); p.add_argument("path")
     p = sub.add_parser("ingest-zeek"); p.add_argument("path")
@@ -934,6 +1250,8 @@ def main():
 
     sub.add_parser("stats")
     p = sub.add_parser("runs"); p.add_argument("--limit", type=int, default=20)
+    p = sub.add_parser("cluster"); p.add_argument("--limit", type=int, default=20)
+    sub.add_parser("loc")
 
     a = ap.parse_args()
     if a.cmd == "init":
@@ -943,6 +1261,8 @@ def main():
     if a.cmd == "sweep":            sweep(a)
     elif a.cmd == "refresh-vendors":
         print("vendors updated:", refresh_vendors(conn))
+    elif a.cmd == "contribute":
+        contribute(conn, since=a.since, limit=a.limit)
     elif a.cmd == "marauder":
         rid = start_run(conn, "marauder", f"scanall {a.seconds}s + recon ble {a.ble_seconds}s")
         res = collect_marauder(conn, seconds=a.seconds, ble_seconds=a.ble_seconds, run_id=rid)
@@ -964,6 +1284,8 @@ def main():
     elif a.cmd == "changes":        q_changes(conn, a)
     elif a.cmd == "stats":          q_stats(conn, a)
     elif a.cmd == "runs":           q_runs(conn, a)
+    elif a.cmd == "cluster":        q_cluster(conn, a)
+    elif a.cmd == "loc":            print(json.dumps(resolve_location(refresh=True), indent=2))
     conn.close()
 
 
