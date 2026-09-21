@@ -21,5 +21,7 @@ otherwise.
 | `hf-model-vetting/` | Data-gathering script + checklist for telling a real HuggingFace model release from a spam/rebrand repo |
 | `openclaw-subagents/` | OpenClaw multi-agent routing bugs — two wrong fixes tried before the real one (a `bindings` entry, not `default:true` or `systemAgent`), plus real VRAM and thinking-level findings |
 | `ghostesp-virtual-sd/` | Two-patch series adding a user-sizeable internal-flash "virtual SD" to GhostESP for boards with no SD slot — patches only, compile-test blocked, not yet flashed |
+| `ghostesp-uart-capture-fix/` | Merged GhostESP command-sender + raw UART listener into one script — the ESP32 exclusively locks its serial port, so two processes fighting over it always lost data. Verified working. |
+| `runpod-context-window-fix/` | Diagnosed why a RunPod-hosted Ollama model's practical context ceiling (~100k) is far below its advertised max (262k) — real VRAM/config numbers, fix identified, not yet applied/verified |
 
 More added case-by-case as work is captured.
