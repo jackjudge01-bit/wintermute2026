@@ -1,11 +1,13 @@
 # ghostesp-virtual-sd
 
-Two-patch series adding a real, user-sizeable "virtual SD card" (internal-flash
+Patch series adding a real, user-sizeable "virtual SD card" (internal-flash
 FAT storage) to [GhostESP](https://github.com/GhostESP-Revival/GhostESP) for
 boards that have no physical SD slot — starting with a plain ESP32-S3
-DevKitC-1-style board (16MB flash, 8MB PSRAM). **Patches only — not applied,
-not compiled, not flashed.** Status: blocked before a compile test could run
-(see "Where this stopped" below).
+DevKitC-1-style board (16MB flash, 8MB PSRAM). **Status: compiled, flashed to
+real hardware, and verified over serial** — see `04-hardware-verification.md`
+for the full result. Three patches, applied in order: `01` (static
+partition), `02` (dynamic sizing), `03` (a one-file fix required to compile
+`02` against ESP-IDF v6.1 — see `03-fix-mbedtls-md5-idf61-NOTES.md`).
 
 ## Why
 
@@ -36,7 +38,7 @@ extends it.
   + `coredump`) — on a 16MB chip that's **12MB of flash sitting completely
   unpartitioned**, which is what patch 1 claims a slice of.
 
-## The two patches
+## The patches
 
 ### `01-static-partition.patch`
 Adds a new board-identity flag `CONFIG_IS_GENERIC_ESP32S3_16MB` (same shape
@@ -73,6 +75,17 @@ sector and verifies readback before committing to the live table sector, but
 a power loss mid-write to the live sector would still need `esptool`
 recovery. That's a real limitation of the current design, not fixed here.
 
+### `03-fix-mbedtls-md5-idf61.patch` (layered on top of 01+02)
+One-file fix, found by actually compiling this against ESP-IDF v6.1:
+`02`'s new `sd_vstorage_manager.c` included `mbedtls/md5.h` and called
+`mbedtls_md5()`, but ESP-IDF v6.1's mbedtls component (mbedtls 4.x /
+TF-PSA-Crypto) no longer ships that header publicly. Swapped it for
+ESP-IDF's own `esp_rom_md5.h` API — the same one
+`components/bootloader_support/src/flash_partitions.c` uses to verify this
+exact MD5 partition-table-checksum entry, so the digest matches what the
+bootloader checks on boot. See `03-fix-mbedtls-md5-idf61-NOTES.md` for the
+full root-cause writeup.
+
 ## Verification status — be clear-eyed about this
 
 - The binary partition-table format used in `02` was cross-checked directly
@@ -80,25 +93,26 @@ recovery. That's a real limitation of the current design, not fixed here.
   (`v6.1`) — `esp_flash_partitions.h`, `flash_partitions.c`,
   `partition.c`, `gen_esp32part.py` — not recalled from memory. High
   confidence the on-disk format itself is correct.
-- **Neither patch has been compiled.** Verification so far is: clean
-  `git apply` of both patches in sequence onto a fresh clone, and manual
-  source review (brace-matching, signature-matching, re-reading). No
-  compiler has touched this code yet.
-- Runtime behavior (actual flash erase/write timing, mbedtls_md5 linkage,
-  real-chip edge cases) is **unverified** and can't be assessed without an
-  actual build + flash.
+- **All three patches have been compiled, and the result flashed to and run
+  on real hardware.** `01` + `02` apply cleanly in sequence onto a fresh
+  clone; `02` alone does not compile against ESP-IDF v6.1 without `03`
+  (see `03-fix-mbedtls-md5-idf61-NOTES.md` for why — a header ESP-IDF v6.1's
+  mbedtls no longer ships publicly). With `03` applied, `idf.py build` on
+  `configs/sdkconfig.generic_esp32s3_16mb` succeeds cleanly.
+- Flashed to the actual 16MB-flash/8MB-PSRAM ESP32-S3 board this series
+  targets. `chipinfo` and `sd vstorage info` over serial confirm the new
+  board identity, the static 4MB `storage` partition at the right
+  offset/size, and a sane dynamic-sizing cap computed from live free-flash
+  numbers. A manual `sd write` / `sd cat` round trip through the mounted
+  virtual storage was also confirmed working. Full detail and exact serial
+  output in `04-hardware-verification.md`.
+- **Still unverified**: the partition-table *resize* path (`sd vstorage
+  create|resize|delete` — writing a new partition table to a running device
+  and surviving the required reboot). That's the genuinely risky part
+  flagged in `02-dynamic-sizing-NOTES.md`, and it hasn't been exercised on
+  hardware yet.
 
-## Where this stopped
-
-A compile-test pass (installing/using GBT + ESP-IDF v6.1 to actually build
-`configs/sdkconfig.generic_esp32s3_16mb`) was attempted and blocked — not by
-the build itself, but by a session-level safety classifier unrelated to this
-code, which will keep blocking sub-agent delegation for the rest of that
-session regardless of how the request is phrased. Compiling was never
-reached. **Next step, in a fresh session: actually build this** before
-trusting `02-dynamic-sizing.patch`'s risky partition-table code any further.
-
-## Applying (once compile-tested)
+## Applying
 
 ```bash
 git clone --branch Development-deki --single-branch \
@@ -106,7 +120,9 @@ git clone --branch Development-deki --single-branch \
 cd GhostESP
 git apply /path/to/01-static-partition.patch
 git apply /path/to/02-dynamic-sizing.patch
+git apply /path/to/03-fix-mbedtls-md5-idf61.patch   # required for ESP-IDF v6.1
 # then build configs/sdkconfig.generic_esp32s3_16mb via GBT / idf.py
 ```
 
-Not flashed to real hardware at any point during this work.
+See `04-hardware-verification.md` for the build/flash/serial-verification
+results and the exact `sd` commands used to test read/write.
