@@ -1,0 +1,881 @@
+diff --git a/.github/workflows/compile_all.yml b/.github/workflows/compile_all.yml
+index cf3c7aac..e3d4ab2f 100644
+--- a/.github/workflows/compile_all.yml
++++ b/.github/workflows/compile_all.yml
+@@ -98,6 +98,7 @@ jobs:
+           - { name: "XIAO_C5",                 idf_target: "esp32c5", sdkconfig_file: "configs/sdkconfig.xiao_esp32c5",                    zip_name: "XIAO_C5.zip" }
+           - { name: "Marauder V8",             idf_target: "esp32c5", sdkconfig_file: "configs/sdkconfig.MarauderV8",                      zip_name: "MarauderV8.zip" }
+           - { name: "Marauder Pancake",        idf_target: "esp32c5", sdkconfig_file: "configs/sdkconfig.Pancake",                         zip_name: "MarauderPancake.zip" }
++          - { name: "Generic ESP32-S3 16MB",   idf_target: "esp32s3", sdkconfig_file: "configs/sdkconfig.generic_esp32s3_16mb",           zip_name: "Generic_ESP32S3_16MB.zip" }
+ 
+     steps:
+       - uses: actions/checkout@v4
+diff --git a/build.py b/build.py
+index 3762d40f..e4f3f3bb 100644
+--- a/build.py
++++ b/build.py
+@@ -411,7 +411,8 @@ def get_build_targets() -> List[Dict[str, str]]:
+         {"name": "Cardputer ADV", "idf_target": "esp32s3", "sdkconfig_file": "configs/sdkconfig.cardputeradv", "zip_name": "CardputerADV.zip"},
+         {"name": "Marauder V8", "idf_target": "esp32c5", "sdkconfig_file": "configs/sdkconfig.MarauderV8", "zip_name": "MarauderV8.zip"},
+         {"name": "Marauder Pancake", "idf_target": "esp32c5", "sdkconfig_file": "configs/sdkconfig.Pancake", "zip_name": "MarauderPancake.zip"},
+-        {"name": "Banshee C5", "idf_target": "esp32c5", "sdkconfig_file": "configs/sdkconfig.somethingsomething", "zip_name": "Banshee-C5.zip"}
++        {"name": "Banshee C5", "idf_target": "esp32c5", "sdkconfig_file": "configs/sdkconfig.somethingsomething", "zip_name": "Banshee-C5.zip"},
++        {"name": "Generic ESP32-S3 16MB", "idf_target": "esp32s3", "sdkconfig_file": "configs/sdkconfig.generic_esp32s3_16mb", "zip_name": "Generic_ESP32S3_16MB.zip"}
+     ]
+ 
+ def validate_project_directory() -> bool:
+diff --git a/include/managers/sd_card_manager.h b/include/managers/sd_card_manager.h
+index 3304e750..a1703f8e 100644
+--- a/include/managers/sd_card_manager.h
++++ b/include/managers/sd_card_manager.h
+@@ -79,6 +79,7 @@ esp_err_t sd_card_save_config();
+ esp_err_t sd_card_load_config();
+ void sd_card_print_config();
+ bool sd_card_is_virtual_storage();
++bool sd_card_virtual_storage_supported();
+ 
+ // mount sd just-in-time for short io, then unmount after
+ esp_err_t sd_card_mount_for_flush(bool *display_was_suspended);
+diff --git a/include/managers/sd_vstorage_manager.h b/include/managers/sd_vstorage_manager.h
+new file mode 100644
+index 00000000..a799fb27
+--- /dev/null
++++ b/include/managers/sd_vstorage_manager.h
+@@ -0,0 +1,150 @@
++#ifndef SD_VSTORAGE_MANAGER_H
++#define SD_VSTORAGE_MANAGER_H
++
++#include "esp_err.h"
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++/*
++ * Dynamic sizing for the "storage" FAT data partition used by boards that
++ * have no physical SD card slot (S3TWatch, AtomS3R, and the generic
++ * ESP32-S3 16MB board -- see CONFIG_IS_S3TWATCH / CONFIG_IS_ATOMS3R /
++ * CONFIG_IS_GENERIC_ESP32S3_16MB and mount_virtual_storage() in
++ * main/managers/sd_card_manager.c). Those boards mount a wear-levelled FAT
++ * filesystem out of a "storage" data partition instead of an SD card, and
++ * until now that partition's size was baked into a static
++ * partitions_*.csv at build time. This module lets the user pick that size
++ * at runtime instead, by rewriting the on-flash partition table directly.
++ *
++ * IMPORTANT -- reboot is required after any write:
++ * ESP-IDF's esp_partition_* API reads and caches the partition table once,
++ * lazily, on first use after boot (see components/esp_partition/partition.c
++ * load_partitions() / ensure_partitions_loaded() in ESP-IDF), and never
++ * re-reads it afterwards. Writing a new table here does NOT take effect
++ * until the device reboots. Nothing in this file attempts to mount,
++ * unmount, or remount storage, or to reinitialize the partition subsystem --
++ * the CLI layer (main/core/commands/cmd_sd.c, "sd vstorage ...") is
++ * responsible for telling the user a reboot is required.
++ *
++ * SAFETY MODEL (read before touching this file):
++ * A new table is built entirely in RAM from the partitions ESP-IDF already
++ * validated at boot (via esp_partition_find, not a hand-rolled raw-flash
++ * parse), staged to a scratch flash sector, read back and compared
++ * byte-for-byte, and only THEN erased+written to the live partition-table
++ * sector at CONFIG_PARTITION_TABLE_OFFSET (0x8000 by default). This catches
++ * a corrupt/garbled table (bad RAM, flash write glitch, bug in this code)
++ * before it ever reaches the live sector.
++ *
++ * This does NOT make the live write itself atomic or power-loss-proof:
++ * stock ESP-IDF has no concept of a backup/alternate partition-table slot
++ * for this chip target, so if power is lost between the live-sector erase
++ * and the completion of the live-sector write, the device will fail to
++ * boot (the bootloader's own esp_partition_table_verify() will find no
++ * valid entries), and recovery requires reflashing over the wire (e.g.
++ * esptool) with a serial/USB connection. That is an inherent limitation of
++ * stock ESP-IDF partition tables on this chip family, not something this
++ * module can fully close -- the scratch-then-verify step only guarantees
++ * we do not knowingly commit a *bad* table, not that the commit write
++ * itself cannot be interrupted.
++ */
++
++typedef enum {
++    SD_VSTORAGE_OK = 0,
++    SD_VSTORAGE_ERR_NOT_SUPPORTED,  // board has no virtual-storage mechanism (see CONFIG_IS_*)
++    SD_VSTORAGE_ERR_TOO_LARGE,      // requested size exceeds size_cap_bytes()
++    SD_VSTORAGE_ERR_TOO_SMALL,      // requested size below SD_VSTORAGE_MIN_SIZE_BYTES
++    SD_VSTORAGE_ERR_NO_CHANGE,      // resize requested but size already matches
++    SD_VSTORAGE_ERR_NOT_FOUND,      // resize/delete requested but no "storage" partition exists
++    SD_VSTORAGE_ERR_TABLE_FULL,     // no room left for one more partition-table entry
++    SD_VSTORAGE_ERR_FLASH_IO,       // read/erase/write against flash failed
++    SD_VSTORAGE_ERR_VERIFY_FAILED,  // scratch-write readback didn't match what was written
++    SD_VSTORAGE_ERR_INVALID_ARG,    // bad argument (NULL out pointer, size 0, etc.)
++    SD_VSTORAGE_ERR_INTERNAL,       // unexpected/should-not-happen state
++} sd_vstorage_status_t;
++
++// Minimum viable size for the "storage" FAT partition. Matches the 64KB
++// floor mount_virtual_storage() already enforces in sd_card_manager.c.
++#define SD_VSTORAGE_MIN_SIZE_BYTES (64u * 1024u)
++
++// One SPI flash erase sector. The partition table region and this module's
++// scratch staging region are each exactly one sector.
++#define SD_VSTORAGE_SECTOR_SIZE 0x1000u
++
++// Label used for the virtual-storage data partition. Must match the label
++// mount_virtual_storage() looks up in sd_card_manager.c ("storage").
++#define SD_VSTORAGE_PARTITION_LABEL "storage"
++
++// Numbers reported by sd_vstorage_get_info() / "sd vstorage info".
++typedef struct {
++    uint64_t chip_total_bytes;    // esp_flash_get_size()
++    uint64_t used_bytes;          // sum of all other partitions + table sector + scratch sector
++    uint64_t free_bytes;          // chip_total_bytes - used_bytes (0 if that would underflow)
++    uint64_t cap_bytes;           // size_cap_bytes(): 80% of free_bytes, integer floor
++    bool storage_exists;
++    uint32_t storage_offset;      // valid only if storage_exists
++    uint32_t storage_size_bytes;  // valid only if storage_exists
++} sd_vstorage_info_t;
++
++/*
++ * Sums the size of every partition currently in the live table, plus the
++ * fixed-offset partition-table sector itself and this module's reserved
++ * scratch sector, subtracts that total from esp_flash_get_size(), and
++ * returns the remainder via *out_free_bytes.
++ *
++ * This is generic: nothing here is hardcoded to a particular chip size or
++ * to a particular existing partition layout, so it works on any GhostESP
++ * board, not just a 16MB-flash one.
++ */
++sd_vstorage_status_t calc_free_flash_space(uint64_t *out_free_bytes);
++
++// 80% of calc_free_flash_space(), rounded down (integer floor via
++// (free_bytes * 4) / 5 -- deliberately not floating point).
++sd_vstorage_status_t size_cap_bytes(uint64_t *out_cap_bytes);
++
++// Fills *out_info with the numbers above plus the current "storage"
++// partition's location/size, if one exists.
++sd_vstorage_status_t sd_vstorage_get_info(sd_vstorage_info_t *out_info);
++
++/*
++ * Core of "sd vstorage create" / "sd vstorage resize". Validates
++ * size_bytes against size_cap_bytes() and SD_VSTORAGE_MIN_SIZE_BYTES,
++ * then builds a new partition table with a "storage"
++ * (ESP_PARTITION_TYPE_DATA / ESP_PARTITION_SUBTYPE_DATA_FAT) entry of
++ * exactly size_bytes:
++ *   - if no "storage" partition exists yet, appends one immediately after
++ *     the last entry in the current table, sector-aligned (this is what
++ *     the CLI exposes as "create");
++ *   - if one already exists, resizes it IN PLACE at its existing offset
++ *     (this is "resize"). A resize destroys the partition's prior FAT
++ *     contents -- the old filesystem's size/geometry no longer matches the
++ *     partition bounds, so the caller MUST treat this as destructive and
++ *     have already obtained explicit user confirmation before calling this
++ *     for an existing partition. This function itself does not prompt or
++ *     ask; see the confirm-flag handling in cmd_sd.c's "sd vstorage
++ *     resize" handler.
++ *
++ * Never mounts, unmounts, or formats anything, and never touches the live
++ * partition-table sector until the scratch-staged copy has been written
++ * back and verified byte-for-byte (see the safety-model note above).
++ *
++ * On SD_VSTORAGE_OK, *out_reboot_required is always set true: the new
++ * table is now committed to flash, but ESP-IDF will not see it until the
++ * device reboots.
++ */
++sd_vstorage_status_t create_or_resize_storage_partition(uint32_t size_bytes,
++                                                          bool *out_reboot_required);
++
++/*
++ * Removes the "storage" partition from the table entirely, freeing that
++ * space back to calc_free_flash_space(). Returns SD_VSTORAGE_ERR_NOT_FOUND
++ * if no "storage" partition currently exists. Uses the same
++ * scratch-then-verify-then-commit write path and reboot-required contract
++ * as create_or_resize_storage_partition().
++ */
++sd_vstorage_status_t delete_storage_partition(bool *out_reboot_required);
++
++// Human-readable string for a sd_vstorage_status_t, for CLI/log output.
++const char *sd_vstorage_status_str(sd_vstorage_status_t status);
++
++#endif // SD_VSTORAGE_MANAGER_H
+diff --git a/main/core/commands/cmd_sd.c b/main/core/commands/cmd_sd.c
+index 6f535045..2f4ff637 100644
+--- a/main/core/commands/cmd_sd.c
++++ b/main/core/commands/cmd_sd.c
+@@ -5,6 +5,7 @@
+ #include "core/glog.h"
+ #include "esp_vfs_fat.h"
+ #include "managers/sd_card_manager.h"
++#include "managers/sd_vstorage_manager.h"
+ #include "managers/status_display_manager.h"
+ #include "sdkconfig.h"
+ #include "mbedtls/base64.h"
+@@ -162,6 +163,10 @@ void handle_sd_cmd(int argc, char **argv) {
+         glog("  sd mkdir <path>                  - Create directory\n");
+         glog("  sd rm <idx|path>                 - Delete file or empty directory\n");
+         glog("  sd tree [path] [depth]           - Recursive listing\n");
++        glog("  sd vstorage info                 - Show flash usage and the storage size cap\n");
++        glog("  sd vstorage create <MB>          - Create the virtual-storage partition\n");
++        glog("  sd vstorage resize <MB> -y       - Resize it (DESTROYS existing contents)\n");
++        glog("  sd vstorage delete -y            - Delete it, freeing the space back\n");
+         return;
+     }
+ 
+@@ -769,6 +774,168 @@ void handle_sd_cmd(int argc, char **argv) {
+         return;
+     }
+ 
++    if (strcmp(sub, "vstorage") == 0) {
++        if (argc < 3) {
++            glog("SD:VSTORAGE:USAGE\n");
++            glog("  sd vstorage info                 - Show flash usage and the storage size cap\n");
++            glog("  sd vstorage create <MB>          - Create the virtual-storage partition\n");
++            glog("  sd vstorage resize <MB> -y       - Resize it (DESTROYS existing contents)\n");
++            glog("  sd vstorage delete -y            - Delete it, freeing the space back\n");
++            return;
++        }
++        const char *vsub = argv[2];
++
++        if (strcmp(vsub, "info") == 0) {
++            sd_vstorage_info_t info;
++            sd_vstorage_status_t st = sd_vstorage_get_info(&info);
++            if (st != SD_VSTORAGE_OK) {
++                glog("SD:VSTORAGE:ERR:%s\n", sd_vstorage_status_str(st));
++                return;
++            }
++            glog("SD:VSTORAGE:INFO:chip_total_bytes=%llu\n", (unsigned long long)info.chip_total_bytes);
++            glog("SD:VSTORAGE:INFO:chip_total_mb=%llu\n", (unsigned long long)(info.chip_total_bytes / (1024 * 1024)));
++            glog("SD:VSTORAGE:INFO:used_bytes=%llu\n", (unsigned long long)info.used_bytes);
++            glog("SD:VSTORAGE:INFO:used_mb=%llu\n", (unsigned long long)(info.used_bytes / (1024 * 1024)));
++            glog("SD:VSTORAGE:INFO:free_bytes=%llu\n", (unsigned long long)info.free_bytes);
++            glog("SD:VSTORAGE:INFO:free_mb=%llu\n", (unsigned long long)(info.free_bytes / (1024 * 1024)));
++            glog("SD:VSTORAGE:INFO:cap_bytes=%llu\n", (unsigned long long)info.cap_bytes);
++            glog("SD:VSTORAGE:INFO:cap_mb=%llu\n", (unsigned long long)(info.cap_bytes / (1024 * 1024)));
++            if (info.storage_exists) {
++                glog("SD:VSTORAGE:INFO:storage_exists=true\n");
++                glog("SD:VSTORAGE:INFO:storage_offset=0x%lx\n", (unsigned long)info.storage_offset);
++                glog("SD:VSTORAGE:INFO:storage_size_bytes=%lu\n", (unsigned long)info.storage_size_bytes);
++                glog("SD:VSTORAGE:INFO:storage_size_mb=%lu\n", (unsigned long)(info.storage_size_bytes / (1024 * 1024)));
++            } else {
++                glog("SD:VSTORAGE:INFO:storage_exists=false\n");
++            }
++            glog("SD:VSTORAGE:INFO:board_mounts_virtual_storage=%s\n",
++                 sd_card_virtual_storage_supported() ? "true" : "false");
++            glog("SD:OK\n");
++            return;
++        }
++
++        if (strcmp(vsub, "create") == 0 || strcmp(vsub, "resize") == 0) {
++            bool is_resize = (strcmp(vsub, "resize") == 0);
++            if (argc < 4) {
++                glog("SD:ERR:usage: sd vstorage %s <MB>%s\n", vsub, is_resize ? " -y" : "");
++                return;
++            }
++            if (!sd_cli_is_number(argv[3])) {
++                glog("SD:ERR:invalid_size:%s\n", argv[3]);
++                return;
++            }
++            long mb = atol(argv[3]);
++            if (mb <= 0 || mb > 4095) {
++                glog("SD:ERR:size_out_of_range:%s\n", argv[3]);
++                return;
++            }
++
++            bool confirmed = false;
++            for (int i = 4; i < argc; i++) {
++                if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0 ||
++                    strcmp(argv[i], "--confirm") == 0) {
++                    confirmed = true;
++                }
++            }
++
++            sd_vstorage_info_t info;
++            bool have_info = (sd_vstorage_get_info(&info) == SD_VSTORAGE_OK);
++            bool exists = have_info && info.storage_exists;
++
++            /* Destructive-action gate. "resize" always needs -y for an
++             * existing partition (that is the explicit ask). "create" is
++             * only destructive -- and therefore only needs -y -- when a
++             * storage partition already exists, since create_or_resize
++             * would then resize it in place; a genuinely fresh create
++             * never needs confirmation. */
++            if (is_resize) {
++                if (!exists) {
++                    glog("SD:ERR:%s\n", sd_vstorage_status_str(SD_VSTORAGE_ERR_NOT_FOUND));
++                    glog("SD:VSTORAGE:HINT:nothing exists to resize, use 'sd vstorage create %ld' instead\n", mb);
++                    return;
++                }
++                if (!confirmed) {
++                    glog("SD:VSTORAGE:WARN:destructive\n");
++                    glog("SD:VSTORAGE:WARN:Resizing DESTROYS the current storage partition's contents (%lu MB at 0x%lx).\n",
++                         (unsigned long)(info.storage_size_bytes / (1024 * 1024)), (unsigned long)info.storage_offset);
++                    glog("SD:ERR:confirmation_required\n");
++                    glog("SD:VSTORAGE:HINT:re-run as: sd vstorage resize %ld -y\n", mb);
++                    return;
++                }
++            } else if (exists && !confirmed) {
++                glog("SD:VSTORAGE:WARN:destructive\n");
++                glog("SD:VSTORAGE:WARN:A storage partition already exists (%lu MB at 0x%lx); creating one now would "
++                     "resize it in place and DESTROY its contents.\n",
++                     (unsigned long)(info.storage_size_bytes / (1024 * 1024)), (unsigned long)info.storage_offset);
++                glog("SD:ERR:confirmation_required\n");
++                glog("SD:VSTORAGE:HINT:re-run as: sd vstorage create %ld -y (or: sd vstorage resize %ld -y)\n", mb, mb);
++                return;
++            }
++
++            uint32_t size_bytes = (uint32_t)mb * 1024u * 1024u;
++            bool reboot_required = false;
++            sd_vstorage_status_t st = create_or_resize_storage_partition(size_bytes, &reboot_required);
++            if (st != SD_VSTORAGE_OK) {
++                glog("SD:ERR:%s\n", sd_vstorage_status_str(st));
++                return;
++            }
++
++            glog("SD:VSTORAGE:%s:OK size_mb=%ld\n", is_resize ? "RESIZE" : "CREATE", mb);
++            if (!sd_card_virtual_storage_supported()) {
++                glog("SD:VSTORAGE:WARN:this firmware build does not mount virtual storage on this board; the "
++                     "partition now exists on flash but nothing will use it.\n");
++            }
++            if (reboot_required) {
++                glog("SD:VSTORAGE:REBOOT_REQUIRED:1\n");
++                glog("SD:VSTORAGE:REBOOT_REQUIRED:Reboot the device now for the new partition table to take effect.\n");
++            }
++            glog("SD:OK\n");
++            return;
++        }
++
++        if (strcmp(vsub, "delete") == 0) {
++            bool confirmed = false;
++            for (int i = 3; i < argc; i++) {
++                if (strcmp(argv[i], "-y") == 0 || strcmp(argv[i], "--yes") == 0 ||
++                    strcmp(argv[i], "--confirm") == 0) {
++                    confirmed = true;
++                }
++            }
++
++            sd_vstorage_info_t info;
++            bool have_info = (sd_vstorage_get_info(&info) == SD_VSTORAGE_OK);
++            if (!have_info || !info.storage_exists) {
++                glog("SD:ERR:%s\n", sd_vstorage_status_str(SD_VSTORAGE_ERR_NOT_FOUND));
++                return;
++            }
++            if (!confirmed) {
++                glog("SD:VSTORAGE:WARN:destructive\n");
++                glog("SD:VSTORAGE:WARN:This PERMANENTLY deletes the storage partition (%lu MB at 0x%lx) and all its contents.\n",
++                     (unsigned long)(info.storage_size_bytes / (1024 * 1024)), (unsigned long)info.storage_offset);
++                glog("SD:ERR:confirmation_required\n");
++                glog("SD:VSTORAGE:HINT:re-run as: sd vstorage delete -y\n");
++                return;
++            }
++
++            bool reboot_required = false;
++            sd_vstorage_status_t st = delete_storage_partition(&reboot_required);
++            if (st != SD_VSTORAGE_OK) {
++                glog("SD:ERR:%s\n", sd_vstorage_status_str(st));
++                return;
++            }
++            glog("SD:VSTORAGE:DELETE:OK\n");
++            if (reboot_required) {
++                glog("SD:VSTORAGE:REBOOT_REQUIRED:1\n");
++                glog("SD:VSTORAGE:REBOOT_REQUIRED:Reboot the device now for the freed space to be usable.\n");
++            }
++            glog("SD:OK\n");
++            return;
++        }
++
++        glog("SD:ERR:unknown_vstorage_subcommand:%s\n", vsub);
++        return;
++    }
++
+     glog("SD:ERR:unknown_subcommand:%s\n", sub);
+     sd_cli_cleanup();
+ }
+diff --git a/main/managers/sd_card_manager.c b/main/managers/sd_card_manager.c
+index 1636c194..24c211c8 100644
+--- a/main/managers/sd_card_manager.c
++++ b/main/managers/sd_card_manager.c
+@@ -2115,6 +2115,20 @@ bool sd_card_is_virtual_storage() {
+ #endif
+ }
+ 
++// Compile-time capability check (as opposed to sd_card_is_virtual_storage(),
++// which reports whether it is *currently mounted*): true when this build
++// includes the mount_virtual_storage() code path at all. Used by the
++// "sd vstorage" CLI commands (main/core/commands/cmd_sd.c) to warn when a
++// storage partition is being created/resized on a board whose firmware
++// will never actually mount it.
++bool sd_card_virtual_storage_supported() {
++#if defined(CONFIG_IS_S3TWATCH) || defined(CONFIG_IS_ATOMS3R) || defined(CONFIG_IS_GENERIC_ESP32S3_16MB)
++  return true;
++#else
++  return false;
++#endif
++}
++
+ int get_evil_portal_list(char portal_names[MAX_PORTALS][MAX_PORTAL_NAME]) {
+     const char *portal_dir = "/mnt/ghostesp/evil_portal/portals";
+     DIR *dir = opendir(portal_dir);
+diff --git a/main/managers/sd_vstorage_manager.c b/main/managers/sd_vstorage_manager.c
+new file mode 100644
+index 00000000..ab8c0062
+--- /dev/null
++++ b/main/managers/sd_vstorage_manager.c
+@@ -0,0 +1,464 @@
++// sd_vstorage_manager.c
++//
++// Dynamic sizing for the flash-backed "storage" FAT partition used by
++// boards with no SD card slot (S3TWatch / AtomS3R / generic ESP32-S3 16MB --
++// see mount_virtual_storage() in main/managers/sd_card_manager.c). See the
++// long comment in include/managers/sd_vstorage_manager.h for the safety
++// model before changing anything here -- this file writes raw bytes to the
++// ESP-IDF partition-table flash region, which is not a mistake-tolerant
++// place to improvise.
++//
++// Binary format used here (esp_partition_info_t, magic 0x50AA per entry,
++// MD5 checksum entry with magic 0xEBEB, terminator implied by erased/0xFF
++// padding) was cross-checked directly against the ESP-IDF "v6.1" tag --
++// the same tag .github/workflows/compile_all.yml pins for this repo's CI
++// builds -- specifically:
++//   components/bootloader_support/include/esp_flash_partitions.h
++//   components/bootloader_support/src/flash_partitions.c (esp_partition_table_verify)
++//   components/esp_partition/partition.c (load_partitions, the app-side loader)
++//   components/partition_table/gen_esp32part.py (the canonical CSV -> binary tool)
++// not just recalled from general knowledge. See the NOTES file this patch
++// ships with for the honest confidence assessment on this.
++
++#include "managers/sd_vstorage_manager.h"
++
++#include "esp_flash.h"
++#include "esp_flash_partitions.h"
++#include "esp_log.h"
++#include "esp_partition.h"
++#include "mbedtls/md5.h"
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++static const char *TAG = "SD_VStorage";
++
++// One slot of ESP_PARTITION_TABLE_MAX_ENTRIES (96 for the standard 0xC00
++// table region) is always reserved for the MD5 checksum entry, so the
++// largest number of *real* partitions we can ever write is one less.
++#define VSTORAGE_MAX_ENTRIES (ESP_PARTITION_TABLE_MAX_ENTRIES - 1)
++
++// ---------------------------------------------------------------------
++// Small flash helpers
++// ---------------------------------------------------------------------
++
++static esp_err_t vstorage_get_chip_size(uint64_t *out_size) {
++    uint32_t size32 = 0;
++    esp_err_t err = esp_flash_get_size(NULL, &size32);
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "esp_flash_get_size failed: %s", esp_err_to_name(err));
++        return err;
++    }
++    *out_size = (uint64_t)size32;
++    return ESP_OK;
++}
++
++// Erases exactly one sector at `offset`, writes `len` bytes of `blob` into
++// it, reads the same range back, and byte-compares. Used for BOTH the
++// scratch staging write and the final live-table commit -- same function,
++// same verification, just a different offset.
++static sd_vstorage_status_t vstorage_write_sector_verified(uint32_t offset,
++                                                             const uint8_t *blob,
++                                                             size_t len) {
++    esp_err_t err = esp_flash_erase_region(NULL, offset, SD_VSTORAGE_SECTOR_SIZE);
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "erase @0x%lx failed: %s", (unsigned long)offset, esp_err_to_name(err));
++        return SD_VSTORAGE_ERR_FLASH_IO;
++    }
++
++    err = esp_flash_write(NULL, blob, offset, len);
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "write @0x%lx failed: %s", (unsigned long)offset, esp_err_to_name(err));
++        return SD_VSTORAGE_ERR_FLASH_IO;
++    }
++
++    uint8_t *readback = malloc(len);
++    if (!readback) {
++        ESP_LOGE(TAG, "OOM allocating %zu-byte readback buffer", len);
++        return SD_VSTORAGE_ERR_INTERNAL;
++    }
++    err = esp_flash_read(NULL, readback, offset, len);
++    if (err != ESP_OK) {
++        ESP_LOGE(TAG, "readback @0x%lx failed: %s", (unsigned long)offset, esp_err_to_name(err));
++        free(readback);
++        return SD_VSTORAGE_ERR_FLASH_IO;
++    }
++
++    bool match = (memcmp(readback, blob, len) == 0);
++    free(readback);
++    if (!match) {
++        ESP_LOGE(TAG, "readback @0x%lx did not match what was written", (unsigned long)offset);
++        return SD_VSTORAGE_ERR_VERIFY_FAILED;
++    }
++    return SD_VSTORAGE_OK;
++}
++
++// ---------------------------------------------------------------------
++// Reading the current table (via the already-boot-verified esp_partition
++// API, not a hand-rolled raw flash parse -- see header comment for why)
++// ---------------------------------------------------------------------
++
++static sd_vstorage_status_t vstorage_read_current_entries(esp_partition_info_t *out,
++                                                            size_t cap,
++                                                            size_t *out_count) {
++    if (!out || !out_count || cap == 0) return SD_VSTORAGE_ERR_INVALID_ARG;
++
++    size_t n = 0;
++    esp_partition_iterator_t it = esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, NULL);
++    for (; it != NULL; it = esp_partition_next(it)) {
++        const esp_partition_t *p = esp_partition_get(it);
++        if (!p) continue;
++        if (n >= cap) {
++            esp_partition_iterator_release(it);
++            ESP_LOGE(TAG, "Live partition table has more entries than this module can hold (%zu)", cap);
++            return SD_VSTORAGE_ERR_TABLE_FULL;
++        }
++        esp_partition_info_t *e = &out[n];
++        memset(e, 0, sizeof(*e));
++        e->magic = ESP_PARTITION_MAGIC;
++        e->type = (uint8_t)p->type;
++        e->subtype = (uint8_t)p->subtype;
++        e->pos.offset = p->address;
++        e->pos.size = p->size;
++        // p->label is a NUL-terminated string of at most 16 visible chars.
++        // strncpy round-trips this correctly either way: if the name is
++        // shorter than 16 bytes the remainder is NUL-padded (matches
++        // gen_esp32part.py's struct.pack('16s', name) behavior); if it's
++        // exactly 16 bytes there's simply no NUL byte in the field, which
++        // the ESP-IDF/gen_esp32part.py binary format explicitly allows.
++        strncpy((char *)e->label, p->label, sizeof(e->label));
++        e->flags = 0;
++        if (p->encrypted) e->flags |= PART_FLAG_ENCRYPTED;
++        if (p->readonly) e->flags |= PART_FLAG_READONLY;
++        n++;
++    }
++    esp_partition_iterator_release(it); // it == NULL here; documented safe no-op
++
++    *out_count = n;
++    return SD_VSTORAGE_OK;
++}
++
++static uint64_t vstorage_sum_entries_size(const esp_partition_info_t *entries, size_t count) {
++    uint64_t sum = 0;
++    for (size_t i = 0; i < count; i++) sum += entries[i].pos.size;
++    return sum;
++}
++
++static int vstorage_find_storage_index(const esp_partition_info_t *entries, size_t count) {
++    const size_t label_len = strlen(SD_VSTORAGE_PARTITION_LABEL);
++    for (size_t i = 0; i < count; i++) {
++        if (entries[i].type == ESP_PARTITION_TYPE_DATA &&
++            entries[i].subtype == ESP_PARTITION_SUBTYPE_DATA_FAT &&
++            memcmp(entries[i].label, SD_VSTORAGE_PARTITION_LABEL, label_len + 1) == 0) {
++            return (int)i;
++        }
++    }
++    return -1;
++}
++
++static bool vstorage_ranges_overlap(uint32_t a_off, uint32_t a_size, uint32_t b_off, uint32_t b_size) {
++    uint64_t a_end = (uint64_t)a_off + a_size;
++    uint64_t b_end = (uint64_t)b_off + b_size;
++    return ((uint64_t)a_off < b_end) && ((uint64_t)b_off < a_end);
++}
++
++// skip_index: index to ignore during the check (the entry being resized),
++// or (size_t)-1 to check against every entry (used for a fresh create).
++static sd_vstorage_status_t vstorage_check_no_overlap(const esp_partition_info_t *entries,
++                                                       size_t count, size_t skip_index,
++                                                       uint32_t offset, uint32_t size) {
++    for (size_t i = 0; i < count; i++) {
++        if (i == skip_index) continue;
++        if (vstorage_ranges_overlap(offset, size, entries[i].pos.offset, entries[i].pos.size)) {
++            ESP_LOGE(TAG, "Proposed storage range 0x%lx+0x%lx overlaps existing partition '%.16s' at 0x%lx+0x%lx",
++                      (unsigned long)offset, (unsigned long)size, (const char *)entries[i].label,
++                      (unsigned long)entries[i].pos.offset, (unsigned long)entries[i].pos.size);
++            return SD_VSTORAGE_ERR_INTERNAL;
++        }
++    }
++    return SD_VSTORAGE_OK;
++}
++
++// ---------------------------------------------------------------------
++// Public sizing queries
++// ---------------------------------------------------------------------
++
++sd_vstorage_status_t calc_free_flash_space(uint64_t *out_free_bytes) {
++    if (!out_free_bytes) return SD_VSTORAGE_ERR_INVALID_ARG;
++
++    uint64_t chip_size = 0;
++    if (vstorage_get_chip_size(&chip_size) != ESP_OK) return SD_VSTORAGE_ERR_FLASH_IO;
++
++    esp_partition_info_t entries[VSTORAGE_MAX_ENTRIES];
++    size_t count = 0;
++    sd_vstorage_status_t st = vstorage_read_current_entries(entries, VSTORAGE_MAX_ENTRIES, &count);
++    if (st != SD_VSTORAGE_OK) return st;
++
++    uint64_t used = vstorage_sum_entries_size(entries, count);
++    used += SD_VSTORAGE_SECTOR_SIZE; // the partition-table sector itself (CONFIG_PARTITION_TABLE_OFFSET)
++    used += SD_VSTORAGE_SECTOR_SIZE; // this module's own reserved scratch sector (see header)
++
++    *out_free_bytes = (chip_size > used) ? (chip_size - used) : 0;
++    return SD_VSTORAGE_OK;
++}
++
++sd_vstorage_status_t size_cap_bytes(uint64_t *out_cap_bytes) {
++    if (!out_cap_bytes) return SD_VSTORAGE_ERR_INVALID_ARG;
++    uint64_t free_bytes = 0;
++    sd_vstorage_status_t st = calc_free_flash_space(&free_bytes);
++    if (st != SD_VSTORAGE_OK) return st;
++    // 80% cap, integer floor. Deliberately not floating point: (free*4)/5
++    // is exact, deterministic, and matches "free space * 0.8" for every
++    // free_bytes value without any rounding-mode ambiguity.
++    *out_cap_bytes = (free_bytes / 5) * 4;
++    return SD_VSTORAGE_OK;
++}
++
++sd_vstorage_status_t sd_vstorage_get_info(sd_vstorage_info_t *out_info) {
++    if (!out_info) return SD_VSTORAGE_ERR_INVALID_ARG;
++    memset(out_info, 0, sizeof(*out_info));
++
++    uint64_t chip_size = 0;
++    if (vstorage_get_chip_size(&chip_size) != ESP_OK) return SD_VSTORAGE_ERR_FLASH_IO;
++    out_info->chip_total_bytes = chip_size;
++
++    uint64_t free_bytes = 0;
++    sd_vstorage_status_t st = calc_free_flash_space(&free_bytes);
++    if (st != SD_VSTORAGE_OK) return st;
++    out_info->free_bytes = free_bytes;
++    out_info->used_bytes = (chip_size > free_bytes) ? (chip_size - free_bytes) : 0;
++    out_info->cap_bytes = (free_bytes / 5) * 4;
++
++    const esp_partition_t *p = esp_partition_find_first(
++        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, SD_VSTORAGE_PARTITION_LABEL);
++    if (p) {
++        out_info->storage_exists = true;
++        out_info->storage_offset = p->address;
++        out_info->storage_size_bytes = p->size;
++    }
++    return SD_VSTORAGE_OK;
++}
++
++// ---------------------------------------------------------------------
++// Table serialization (the risky binary-format part)
++// ---------------------------------------------------------------------
++
++// out_blob must be at least ESP_PARTITION_TABLE_MAX_LEN (0xC00) bytes.
++static sd_vstorage_status_t vstorage_build_table_blob(const esp_partition_info_t *entries,
++                                                        size_t count, uint8_t *out_blob) {
++    if (count > VSTORAGE_MAX_ENTRIES) return SD_VSTORAGE_ERR_TABLE_FULL;
++
++    // Fill with 0xFF (erased-flash value) first. Bytes we never explicitly
++    // write -- everything after the MD5 entry, up through the end of the
++    // 0xC00 region -- stay 0xFF, which is exactly what
++    // esp_partition_table_verify() / load_partitions() treat as "no more
++    // entries" (they stop at the first non-magic, non-MD5-magic record,
++    // and an erased/0xFF record's magic field reads as 0xFFFF). This
++    // mirrors gen_esp32part.py's PartitionTable.to_binary(), which pads
++    // the same way.
++    memset(out_blob, 0xFF, ESP_PARTITION_TABLE_MAX_LEN);
++
++    for (size_t i = 0; i < count; i++) {
++        memcpy(out_blob + i * sizeof(esp_partition_info_t), &entries[i], sizeof(esp_partition_info_t));
++    }
++
++    size_t entries_len = count * sizeof(esp_partition_info_t);
++
++    // MD5 entry: magic 0xEBEB (bytes 0xEB,0xEB either byte order, so no LE/BE
++    // ambiguity), 14 bytes of 0xFF padding, then the 16-byte MD5 digest of
++    // every real entry's raw bytes (NOT including this entry itself). This
++    // exact layout -- and the requirement that CONFIG_PARTITION_TABLE_MD5
++    // builds refuse to load a table with no MD5 entry, or one whose digest
++    // doesn't match -- was confirmed against
++    // components/esp_partition/partition.c's load_partitions() and
++    // components/bootloader_support/src/flash_partitions.c's
++    // esp_partition_table_verify() on the esp-idf "v6.1" tag. Getting this
++    // wrong means the device cannot find ANY partitions after reboot.
++    unsigned char digest[16];
++    int mret = mbedtls_md5(out_blob, entries_len, digest);
++    if (mret != 0) {
++        ESP_LOGE(TAG, "mbedtls_md5 failed: %d", mret);
++        return SD_VSTORAGE_ERR_INTERNAL;
++    }
++
++    uint8_t md5_entry[sizeof(esp_partition_info_t)];
++    memset(md5_entry, 0xFF, sizeof(md5_entry));
++    md5_entry[0] = (uint8_t)(ESP_PARTITION_MAGIC_MD5 & 0xFF);
++    md5_entry[1] = (uint8_t)((ESP_PARTITION_MAGIC_MD5 >> 8) & 0xFF);
++    memcpy(md5_entry + ESP_PARTITION_MD5_OFFSET, digest, sizeof(digest));
++    memcpy(out_blob + entries_len, md5_entry, sizeof(md5_entry));
++
++    return SD_VSTORAGE_OK;
++}
++
++// Shared commit path for create/resize/delete: build the blob, stage it to
++// a scratch sector and verify, and ONLY THEN commit it to the live
++// partition-table sector (also verified). See the header's safety-model
++// comment for exactly what this does and does not protect against.
++static sd_vstorage_status_t vstorage_commit_new_table(const esp_partition_info_t *entries,
++                                                        size_t count, bool *out_reboot_required) {
++    *out_reboot_required = false;
++
++    uint8_t *blob = malloc(ESP_PARTITION_TABLE_MAX_LEN);
++    if (!blob) return SD_VSTORAGE_ERR_INTERNAL;
++
++    sd_vstorage_status_t st = vstorage_build_table_blob(entries, count, blob);
++    if (st != SD_VSTORAGE_OK) {
++        free(blob);
++        return st;
++    }
++
++    uint64_t chip_size = 0;
++    if (vstorage_get_chip_size(&chip_size) != ESP_OK) {
++        free(blob);
++        return SD_VSTORAGE_ERR_FLASH_IO;
++    }
++    if (chip_size < SD_VSTORAGE_SECTOR_SIZE) {
++        free(blob);
++        return SD_VSTORAGE_ERR_INTERNAL;
++    }
++    uint32_t scratch_offset = (uint32_t)(chip_size - SD_VSTORAGE_SECTOR_SIZE);
++
++    ESP_LOGI(TAG, "Staging new partition table (%zu entries) to scratch sector 0x%lx",
++             count, (unsigned long)scratch_offset);
++    st = vstorage_write_sector_verified(scratch_offset, blob, ESP_PARTITION_TABLE_MAX_LEN);
++    if (st != SD_VSTORAGE_OK) {
++        ESP_LOGE(TAG, "Scratch write/verify failed (%s) -- live partition table was NOT touched",
++                 sd_vstorage_status_str(st));
++        free(blob);
++        return st;
++    }
++
++    ESP_LOGW(TAG, "Scratch copy verified OK. Committing to live partition table at 0x%x -- do not power off now.",
++              ESP_PARTITION_TABLE_OFFSET);
++    st = vstorage_write_sector_verified(ESP_PARTITION_TABLE_OFFSET, blob, ESP_PARTITION_TABLE_MAX_LEN);
++    free(blob);
++    if (st != SD_VSTORAGE_OK) {
++        ESP_LOGE(TAG, "Live partition table write/verify FAILED (%s). The device's partition table may now be "
++                      "inconsistent; if it will not boot, reflash over serial (esptool) to recover.",
++                  sd_vstorage_status_str(st));
++        return st;
++    }
++
++    ESP_LOGW(TAG, "Live partition table updated. A reboot is required for it to take effect.");
++    *out_reboot_required = true;
++    return SD_VSTORAGE_OK;
++}
++
++// ---------------------------------------------------------------------
++// Public mutation API
++// ---------------------------------------------------------------------
++
++sd_vstorage_status_t create_or_resize_storage_partition(uint32_t size_bytes, bool *out_reboot_required) {
++    if (!out_reboot_required) return SD_VSTORAGE_ERR_INVALID_ARG;
++    *out_reboot_required = false;
++
++    if (size_bytes < SD_VSTORAGE_MIN_SIZE_BYTES) return SD_VSTORAGE_ERR_TOO_SMALL;
++    if (size_bytes % SD_VSTORAGE_SECTOR_SIZE != 0) return SD_VSTORAGE_ERR_INVALID_ARG;
++
++    uint64_t cap = 0;
++    sd_vstorage_status_t st = size_cap_bytes(&cap);
++    if (st != SD_VSTORAGE_OK) return st;
++    if ((uint64_t)size_bytes > cap) return SD_VSTORAGE_ERR_TOO_LARGE;
++
++    esp_partition_info_t entries[VSTORAGE_MAX_ENTRIES];
++    size_t count = 0;
++    st = vstorage_read_current_entries(entries, VSTORAGE_MAX_ENTRIES, &count);
++    if (st != SD_VSTORAGE_OK) return st;
++
++    uint64_t chip_size = 0;
++    if (vstorage_get_chip_size(&chip_size) != ESP_OK) return SD_VSTORAGE_ERR_FLASH_IO;
++    if (chip_size < SD_VSTORAGE_SECTOR_SIZE) return SD_VSTORAGE_ERR_INTERNAL;
++    // Never let the storage partition reach into this module's reserved
++    // scratch sector at the very top of the chip.
++    uint32_t reach_limit = (uint32_t)(chip_size - SD_VSTORAGE_SECTOR_SIZE);
++
++    int idx = vstorage_find_storage_index(entries, count);
++    if (idx >= 0) {
++        // Resize in place. DESTRUCTIVE: the existing FAT filesystem's
++        // geometry no longer matches the new partition bounds. The caller
++        // (cmd_sd.c) is responsible for having already obtained explicit
++        // user confirmation -- this function does not ask.
++        uint32_t offset = entries[idx].pos.offset;
++        if (size_bytes == entries[idx].pos.size) return SD_VSTORAGE_ERR_NO_CHANGE;
++        if ((uint64_t)offset + size_bytes > reach_limit) return SD_VSTORAGE_ERR_TOO_LARGE;
++        st = vstorage_check_no_overlap(entries, count, (size_t)idx, offset, size_bytes);
++        if (st != SD_VSTORAGE_OK) return st;
++
++        ESP_LOGW(TAG, "Resizing existing 'storage' partition at 0x%lx: %lu -> %lu bytes (contents destroyed)",
++                  (unsigned long)offset, (unsigned long)entries[idx].pos.size, (unsigned long)size_bytes);
++        entries[idx].pos.size = size_bytes;
++    } else {
++        // Create: append after the highest end-offset currently in the table.
++        if (count >= VSTORAGE_MAX_ENTRIES) return SD_VSTORAGE_ERR_TABLE_FULL;
++
++        uint64_t highest_end = 0;
++        for (size_t i = 0; i < count; i++) {
++            uint64_t end = (uint64_t)entries[i].pos.offset + entries[i].pos.size;
++            if (end > highest_end) highest_end = end;
++        }
++        uint64_t new_offset64 =
++            (highest_end + (SD_VSTORAGE_SECTOR_SIZE - 1)) & ~((uint64_t)SD_VSTORAGE_SECTOR_SIZE - 1);
++        if (new_offset64 + size_bytes > reach_limit) return SD_VSTORAGE_ERR_TOO_LARGE;
++        uint32_t new_offset = (uint32_t)new_offset64;
++
++        st = vstorage_check_no_overlap(entries, count, (size_t)-1, new_offset, size_bytes);
++        if (st != SD_VSTORAGE_OK) return st;
++
++        esp_partition_info_t *e = &entries[count];
++        memset(e, 0, sizeof(*e));
++        e->magic = ESP_PARTITION_MAGIC;
++        e->type = ESP_PARTITION_TYPE_DATA;
++        e->subtype = ESP_PARTITION_SUBTYPE_DATA_FAT;
++        e->pos.offset = new_offset;
++        e->pos.size = size_bytes;
++        strncpy((char *)e->label, SD_VSTORAGE_PARTITION_LABEL, sizeof(e->label));
++        e->flags = 0;
++        count++;
++
++        ESP_LOGI(TAG, "Creating new 'storage' partition at 0x%lx, size %lu bytes",
++                 (unsigned long)new_offset, (unsigned long)size_bytes);
++    }
++
++    return vstorage_commit_new_table(entries, count, out_reboot_required);
++}
++
++sd_vstorage_status_t delete_storage_partition(bool *out_reboot_required) {
++    if (!out_reboot_required) return SD_VSTORAGE_ERR_INVALID_ARG;
++    *out_reboot_required = false;
++
++    esp_partition_info_t entries[VSTORAGE_MAX_ENTRIES];
++    size_t count = 0;
++    sd_vstorage_status_t st = vstorage_read_current_entries(entries, VSTORAGE_MAX_ENTRIES, &count);
++    if (st != SD_VSTORAGE_OK) return st;
++
++    int idx = vstorage_find_storage_index(entries, count);
++    if (idx < 0) return SD_VSTORAGE_ERR_NOT_FOUND;
++
++    ESP_LOGW(TAG, "Deleting 'storage' partition at 0x%lx (%lu bytes)",
++              (unsigned long)entries[idx].pos.offset, (unsigned long)entries[idx].pos.size);
++
++    for (size_t i = (size_t)idx; i + 1 < count; i++) {
++        entries[i] = entries[i + 1];
++    }
++    count--;
++
++    return vstorage_commit_new_table(entries, count, out_reboot_required);
++}
++
++const char *sd_vstorage_status_str(sd_vstorage_status_t status) {
++    switch (status) {
++        case SD_VSTORAGE_OK: return "ok";
++        case SD_VSTORAGE_ERR_NOT_SUPPORTED: return "not supported on this board";
++        case SD_VSTORAGE_ERR_TOO_LARGE: return "requested size exceeds the 80% cap";
++        case SD_VSTORAGE_ERR_TOO_SMALL: return "requested size is below the minimum";
++        case SD_VSTORAGE_ERR_NO_CHANGE: return "requested size matches the current size";
++        case SD_VSTORAGE_ERR_NOT_FOUND: return "no storage partition exists";
++        case SD_VSTORAGE_ERR_TABLE_FULL: return "partition table has no room for another entry";
++        case SD_VSTORAGE_ERR_FLASH_IO: return "flash read/erase/write failed";
++        case SD_VSTORAGE_ERR_VERIFY_FAILED: return "readback verification failed";
++        case SD_VSTORAGE_ERR_INVALID_ARG: return "invalid argument";
++        case SD_VSTORAGE_ERR_INTERNAL: return "internal error";
++        default: return "unknown";
++    }
++}
