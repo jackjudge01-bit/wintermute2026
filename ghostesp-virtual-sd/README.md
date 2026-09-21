@@ -5,9 +5,13 @@ FAT storage) to [GhostESP](https://github.com/GhostESP-Revival/GhostESP) for
 boards that have no physical SD slot — starting with a plain ESP32-S3
 DevKitC-1-style board (16MB flash, 8MB PSRAM). **Status: compiled, flashed to
 real hardware, and verified over serial** — see `04-hardware-verification.md`
-for the full result. Three patches, applied in order: `01` (static
+for the full result. Four patches, applied in order: `01` (static
 partition), `02` (dynamic sizing), `03` (a one-file fix required to compile
-`02` against ESP-IDF v6.1 — see `03-fix-mbedtls-md5-idf61-NOTES.md`).
+`02` against ESP-IDF v6.1 — see `03-fix-mbedtls-md5-idf61-NOTES.md`), `05`
+(fixes a device panic that mounting this virtual SD exposes in GhostESP's
+own pcap capture code — see `05-fix-pcap-callback-stack-overflow-NOTES.md`;
+unrelated to the storage partition itself, independent of `02`/`03`, but
+only surfaces once SD is actually mounted for capture to write to).
 
 ## Why
 
@@ -121,8 +125,11 @@ cd GhostESP
 git apply /path/to/01-static-partition.patch
 git apply /path/to/02-dynamic-sizing.patch
 git apply /path/to/03-fix-mbedtls-md5-idf61.patch   # required for ESP-IDF v6.1
+git apply /path/to/05-fix-pcap-callback-stack-overflow.patch   # capture + SD mounted panics without this
 # then build configs/sdkconfig.generic_esp32s3_16mb via GBT / idf.py
 ```
 
 See `04-hardware-verification.md` for the build/flash/serial-verification
-results and the exact `sd` commands used to test read/write.
+results and the exact `sd` commands used to test read/write. See
+`05-fix-pcap-callback-stack-overflow-NOTES.md` for the capture-crash fix —
+build-verified only, not yet flashed/re-tested on hardware.

@@ -1,0 +1,141 @@
+diff --git a/include/core/callbacks.h b/include/core/callbacks.h
+index 8293eb93..8eeb8fc3 100644
+--- a/include/core/callbacks.h
++++ b/include/core/callbacks.h
+@@ -3,6 +3,7 @@
+ #include "esp_wifi_types.h"
+ #include "freertos/FreeRTOS.h"
+ #include "vendor/GPS/MicroNMEA.h"
++#include "vendor/pcap.h"
+ #include <stdbool.h>
+ #include <stddef.h>
+ #include <esp_timer.h>
+@@ -106,6 +107,14 @@ extern bool g_listen_probes_save_to_sd;
+ // cleanup function to free pcap queue when not capturing
+ void cleanup_pcap_queue(void);
+ 
++// Queue a captured frame for the dedicated pcap writer task to persist to SD
++// (real or virtual) instead of writing/flushing inline from a driver/host
++// callback context. Any capture path that writes to the pcap buffer from a
++// WiFi/BLE/etc. RX or event callback should go through one of these rather
++// than calling pcap_write_packet_to_buffer() directly.
++void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len, pcap_capture_type_t cap_type);
++void enqueue_pcap_write(const uint8_t *payload, uint16_t len);
++
+ // Handshake tracking helpers used by adaptive capture UIs.
+ uint32_t wifi_callbacks_get_handshake_count(void);
+ void wifi_callbacks_reset_handshake_tracking(void);
+diff --git a/main/core/callbacks.c b/main/core/callbacks.c
+index b1895d62..6a6c78fa 100644
+--- a/main/core/callbacks.c
++++ b/main/core/callbacks.c
+@@ -1584,11 +1584,21 @@ static inline void ensure_pcap_queue_started(void) {
+ 
+     s_pcap_q = xQueueCreate(EAPOL_Q_LEN, sizeof(pcap_q_item_t));
+     if (s_pcap_q != NULL && s_pcap_writer_task == NULL) {
+-        xTaskCreate_psram(pcap_writer_task, "pcap_wr", 3072, NULL, 5, &s_pcap_writer_task);
++        // 3072 was not enough: the FATFS/wear-levelling/esp_partition call chain
++        // this task blocks on during _pcap_flush_buffer_to_file_nolock() (fwrite()+
++        // fflush() to the SD-backed file, real or virtual) overflowed it and took
++        // down the whole device with a double-exception panic - reproduced live
++        // against the virtual-SD-backed /mnt/ghostesp/pcaps target. See
++        // ghostesp-virtual-sd/05-fix-pcap-callback-stack-overflow-NOTES.md.
++        xTaskCreate_psram(pcap_writer_task, "pcap_wr", 8192, NULL, 5, &s_pcap_writer_task);
+     }
+ }
+ 
+-static inline void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len, pcap_capture_type_t cap_type) {
++// Not static/inline: called from ble_manager.c and plugin_api_lowlevel.c too,
++// so their capture paths go through the same queued writer task instead of
++// blocking on a flash write from inside their own (unsized-for-that) callback
++// contexts. Declared in callbacks.h.
++void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len, pcap_capture_type_t cap_type) {
+     if (!payload || len == 0) return;
+     ensure_pcap_queue_started();
+     if (!s_pcap_q) return;
+@@ -1619,7 +1629,7 @@ static inline void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len
+     }
+ }
+ 
+-static inline void enqueue_pcap_write(const uint8_t *payload, uint16_t len) {
++void enqueue_pcap_write(const uint8_t *payload, uint16_t len) {
+     if (!s_pcap_enabled) return;
+     enqueue_pcap_write_typed(payload, len, PCAP_CAPTURE_WIFI);
+ }
+@@ -3994,12 +4004,14 @@ void ble_skimmer_scan_callback(struct ble_gap_event *event, void *arg) {
+                     memcpy(enhanced_packet + packet_len, event->disc.data, event->disc.length_data);
+                     packet_len += event->disc.length_data;
+ 
+-                    // Write to PCAP with proper BLE packet format
+-                    pcap_write_packet_to_buffer(enhanced_packet, packet_len,
+-                                                PCAP_CAPTURE_BLUETOOTH);
+-
+-                    // Force flush to ensure suspicious device is captured
+-                    pcap_flush_buffer_to_file();
++                    // Write to PCAP with proper BLE packet format. Queued, not
++                    // written/flushed inline here: this runs in the NimBLE host's
++                    // own event-callback context, and forcing an immediate flush
++                    // (as this used to) blocks on the same FATFS/flash write that
++                    // overflows an undersized stack - see pcap_writer_task above.
++                    // The writer task's own periodic/threshold flush picks this up.
++                    enqueue_pcap_write_typed(enhanced_packet, packet_len,
++                                             PCAP_CAPTURE_BLUETOOTH);
+                 }
+                 break;
+             }
+@@ -4123,12 +4135,10 @@ void wifi_listen_probes_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+         last_probe_log_time_ms = now_ms;
+     }
+ 
+-    // Optionally save packet to SD if enabled
++    // Optionally save packet to SD if enabled. Queued (not written inline
++    // here) for the same reason as the other capture callbacks in this file.
+     if (g_listen_probes_save_to_sd && pkt->rx_ctrl.sig_len > 0) {
+-        esp_err_t ret = pcap_write_packet_to_buffer(payload, pkt->rx_ctrl.sig_len, PCAP_CAPTURE_WIFI);
+-        if (ret != ESP_OK) {
+-            ESP_LOGE("PROBE_LISTEN", "Failed to write packet to buffer");
+-        }
++        enqueue_pcap_write(payload, pkt->rx_ctrl.sig_len);
+     }
+ 
+     // Print to console and display
+diff --git a/main/managers/ble_manager.c b/main/managers/ble_manager.c
+index 4a5ebd19..a82e020b 100644
+--- a/main/managers/ble_manager.c
++++ b/main/managers/ble_manager.c
+@@ -1315,7 +1315,11 @@ static void ble_pcap_callback(struct ble_gap_event *event, size_t len) {
+             }
+         }
+ 
+-        pcap_write_packet_to_buffer(hci_buffer, hci_len, PCAP_CAPTURE_BLUETOOTH);
++        // Queued, not written inline: this runs in the NimBLE host's own
++        // event-callback context, which isn't sized for the FATFS/flash
++        // write pcap_write_packet_to_buffer() can trigger when SD (real or
++        // virtual) is mounted - see callbacks.c's pcap_writer_task.
++        enqueue_pcap_write_typed(hci_buffer, hci_len, PCAP_CAPTURE_BLUETOOTH);
+     }
+ }
+ 
+diff --git a/main/managers/plugin_api_lowlevel.c b/main/managers/plugin_api_lowlevel.c
+index 74795dbd..68c63df1 100644
+--- a/main/managers/plugin_api_lowlevel.c
++++ b/main/managers/plugin_api_lowlevel.c
+@@ -13,6 +13,7 @@
+ #include "managers/nrf24_remote_manager.h"
+ #include "core/uart_share.h"
+ #include "i2c_bus_lock.h"
++#include "core/callbacks.h"
+ #include "vendor/pcap.h"
+ 
+ #if CONFIG_HAS_CAMERA
+@@ -892,7 +893,9 @@ static void plugin_wifi_promisc_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+     (void)type;
+     if (!buf) return;
+     wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
+-    if (s_wifi_pcap_active) pcap_write_packet_to_buffer(pkt->payload, pkt->rx_ctrl.sig_len, PCAP_CAPTURE_WIFI);
++    // Queued, not written inline: this is the raw WiFi driver promiscuous
++    // callback context, same reason as the built-in capture callbacks.
++    if (s_wifi_pcap_active) enqueue_pcap_write(pkt->payload, pkt->rx_ctrl.sig_len);
+     if (s_wifi_packet_cb) s_wifi_packet_cb(pkt->payload, pkt->rx_ctrl.sig_len, pkt->rx_ctrl.rssi, pkt->rx_ctrl.channel, s_wifi_packet_user);
+ }
+ 
