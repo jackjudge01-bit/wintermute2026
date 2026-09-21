@@ -5,17 +5,19 @@ FAT storage) to [GhostESP](https://github.com/GhostESP-Revival/GhostESP) for
 boards that have no physical SD slot — starting with a plain ESP32-S3
 DevKitC-1-style board (16MB flash, 8MB PSRAM). **Status: compiled, flashed to
 real hardware, and verified over serial** — see `04-hardware-verification.md`
-for the full result. Five patches, applied in order: `01` (static
+for the full result. Six patches, applied in order: `01` (static
 partition), `02` (dynamic sizing), `03` (a one-file fix required to compile
 `02` against ESP-IDF v6.1 — see `03-fix-mbedtls-md5-idf61-NOTES.md`), `05`
-(fixes a device panic that mounting this virtual SD exposes in GhostESP's
-own pcap capture code — see `05-fix-pcap-callback-stack-overflow-NOTES.md`;
-unrelated to the storage partition itself, independent of `02`/`03`, but
-only surfaces once SD is actually mounted for capture to write to), `06`
-(fixes the `sd vstorage resize/create/delete` abort() that `02`'s own notes
-flagged as unverified and risky — see
+(two attempted fixes for a device panic that mounting this virtual SD
+exposes in GhostESP's own pcap capture code — see
+`05-fix-pcap-callback-stack-overflow-NOTES.md`; **neither attempt actually
+fixed it, see `07`**), `06` (fixes the `sd vstorage resize/create/delete`
+abort() that `02`'s own notes flagged as unverified and risky — see
 `06-fix-vstorage-resize-abort-NOTES.md`; layered on `02` directly, since
-it's the commit-the-new-partition-table step `02` added that was aborting).
+it's the commit-the-new-partition-table step `02` added that was aborting),
+`07` (the fix that actually resolved the capture-panic `05` attempted twice
+and didn't — see `07-defer-capture-writes-to-stop-NOTES.md`. **Hardware-verified**,
+unlike `05`'s two attempts).
 
 ## Why
 
@@ -125,6 +127,14 @@ full root-cause writeup.
   `06-fix-vstorage-resize-abort-NOTES.md`. That patch is build-verified only;
   the actual resize has not yet been re-run on hardware with the fix
   applied.
+- **Update**: the capture-panic-with-SD-mounted bug `05` attempted to fix
+  (twice, see above) is now actually fixed and **hardware-verified** —
+  `07-defer-capture-writes-to-stop.patch`. `capture -probe` (20s and 30s
+  runs) and `capture -ble` (15s) all completed with zero crashes on the
+  real board, packets written to SD matching the reported counts exactly.
+  See `07-defer-capture-writes-to-stop-NOTES.md` for what actually worked
+  (deferring all SD writes to capture-stop, not the stack/timing fixes `05`
+  tried first) and why the earlier attempts didn't.
 
 ## Applying
 
@@ -135,13 +145,14 @@ cd GhostESP
 git apply /path/to/01-static-partition.patch
 git apply /path/to/02-dynamic-sizing.patch
 git apply /path/to/03-fix-mbedtls-md5-idf61.patch   # required for ESP-IDF v6.1
-git apply /path/to/05-fix-pcap-callback-stack-overflow.patch   # capture + SD mounted panics without this
+git apply /path/to/05-fix-pcap-callback-stack-overflow.patch   # required before 07 (queue infra); does not by itself fix the capture panic
 git apply /path/to/06-fix-vstorage-resize-abort.patch          # sd vstorage resize/create/delete aborts without this
+git apply /path/to/07-defer-capture-writes-to-stop.patch       # the actual capture+SD-mounted panic fix (05 alone doesn't fix it)
 # then build configs/sdkconfig.generic_esp32s3_16mb via GBT / idf.py
 ```
 
 See `04-hardware-verification.md` for the build/flash/serial-verification
-results and the exact `sd` commands used to test read/write. See
-`05-fix-pcap-callback-stack-overflow-NOTES.md` and
-`06-fix-vstorage-resize-abort-NOTES.md` for the two crash fixes — both
-build-verified only, not yet flashed/re-tested on hardware.
+results and the exact `sd` commands used to test read/write.
+`07-defer-capture-writes-to-stop-NOTES.md` is hardware-verified.
+`06-fix-vstorage-resize-abort-NOTES.md` is build-verified only, not yet
+flashed/re-tested on hardware.

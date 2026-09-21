@@ -1,0 +1,144 @@
+diff --git a/include/vendor/pcap.h b/include/vendor/pcap.h
+index 2090930..da17e67 100644
+--- a/include/vendor/pcap.h
++++ b/include/vendor/pcap.h
+@@ -31,8 +31,17 @@ typedef struct {
+ 
+ #define MAX_FILE_NAME_LENGTH 128
+ 
++// Sized to hold an entire typical capture session in RAM: writes to the
++// SD-backed file are now deferred to capture-stop (see pcap_write_packet_to_buffer()
++// and pcap_writer_task() in callbacks.c) rather than happening while WiFi/BLE
++// RX is still active, which is what was panicking the device. 8192 bytes was
++// enough to fill in ~2s of real probe-request traffic, forcing an in-capture
++// flush almost immediately - this is generous enough that a typical capture
++// session shouldn't need one at all. Capture length is now bounded by this
++// buffer (PSRAM has ~8MB free on this board); once full, further packets are
++// dropped (packets_dropped stat) rather than flushed mid-capture.
+ #if CONFIG_SPIRAM
+-#define PCAP_BUFFER_SIZE 8192
++#define PCAP_BUFFER_SIZE (1024 * 1024)
+ #else
+ #define PCAP_BUFFER_SIZE 5120
+ #endif
+diff --git a/main/vendor/pcap.c b/main/vendor/pcap.c
+index f6c3a5d..7ecd145 100644
+--- a/main/vendor/pcap.c
++++ b/main/vendor/pcap.c
+@@ -386,6 +386,12 @@ esp_err_t pcap_init(void) {
+     ESP_LOGI(PCAP_TAG, "PCAP buffer allocated (%d bytes)", PCAP_BUFFER_SIZE);
+   }
+ 
++  // Warm up the writer task/queue/pool here, in whatever (safe, CLI/command)
++  // context called pcap_init() - not lazily on the first packet, which would
++  // run this same setup inline inside a WiFi/BLE driver RX callback instead.
++  // See callbacks.c's ensure_pcap_queue_started() for why that crashed.
++  ensure_pcap_queue_started();
++
+   ESP_LOGI(PCAP_TAG, "PCAP initialized successfully");
+   return ESP_OK;
+ }
+@@ -858,13 +864,18 @@ esp_err_t pcap_write_packet_to_buffer(const void *packet, size_t length,
+   }
+ 
+   if (buffer_offset + total_packet_size > PCAP_BUFFER_SIZE) {
+-    esp_err_t ret = _pcap_flush_buffer_to_file_nolock();
+-    if (ret != ESP_OK) {
+-      s_capture_stats.packets_dropped++;
+-      xSemaphoreGive(pcap_mutex);
+-      ESP_LOGE(PCAP_TAG, "Buffer flush failed");
+-      return ret;
+-    }
++    // Deliberately NOT flushing to the SD-backed file here anymore: this
++    // function runs while WiFi/BLE RX is still active (via the pcap_writer_task
++    // queue), and flushing to SD (real or virtual) during that window is what
++    // was panicking the device. Writes are now deferred entirely to capture
++    // stop (pcap_file_close() does one full flush there, after RX is already
++    // disabled) - see PCAP_BUFFER_SIZE's comment in pcap.h. Once the buffer's
++    // full, further packets for this capture are dropped instead.
++    s_capture_stats.packets_dropped++;
++    xSemaphoreGive(pcap_mutex);
++    ESP_LOGW(PCAP_TAG, "In-RAM capture buffer full (%d bytes) - dropping packet; "
++             "SD write is deferred to capture stop.", PCAP_BUFFER_SIZE);
++    return ESP_ERR_NO_MEM;
+   }
+ 
+   // Write packet header
+diff --git a/main/core/callbacks.c b/main/core/callbacks.c
+index 6a6c78f..6ace063 100644
+--- a/main/core/callbacks.c
++++ b/main/core/callbacks.c
+@@ -1561,19 +1561,29 @@ static void pcap_writer_task(void *arg) {
+                 UBaseType_t hwm_words = uxTaskGetStackHighWaterMark(NULL);
+                 glog("PCAP writer HWM (bytes): %lu\n", (unsigned long)hwm_words);
+             }
+-            if ((processed & 0x1F) == 0 && pcap_auto_flush_enabled()) {
+-                pcap_flush_buffer_to_file();
+-            }
++            // No periodic/idle auto-flush to the SD-backed file anymore: this
++            // task (and thus any flush it triggers) runs while WiFi/BLE RX is
++            // still active, and that's what was panicking the device. All
++            // flushing is now deferred to capture stop (pcap_file_close()
++            // does one full flush there, after RX is already disabled) - see
++            // PCAP_BUFFER_SIZE's comment in pcap.h.
+         } else {
+-            // periodic flush even if idle
+-            if (pcap_auto_flush_enabled()) {
+-                pcap_flush_buffer_to_file();
+-            }
++            // (idle-timeout auto-flush removed for the same reason)
+         }
+     }
+ }
+ 
+-static inline void ensure_pcap_queue_started(void) {
++// Not static/inline: also called proactively from pcap_init() (vendor/pcap.c),
++// itself called from pcap_file_open() at capture-start time in the CLI/command
++// task context, so the queue/pool/writer task are already warm before any RX
++// callback can ever call enqueue_pcap_write*(). Without that, the FIRST-ever
++// call after boot did this whole setup (heap_caps_calloc + xQueueCreate +
++// xTaskCreate_psram) inline inside whichever driver callback happened to call
++// it first - reproduced live as the same double-exception panic even after
++// pcap_writer_task's own stack was fixed (see 05's notes). Still called
++// lazily here too, as a fallback for any capture path that doesn't call
++// pcap_init() first (see 07's notes for the ones that still don't).
++void ensure_pcap_queue_started(void) {
+     if (s_pcap_q != NULL) {
+         return;
+     }
+diff --git a/include/core/callbacks.h b/include/core/callbacks.h
+index 8eeb8fc..46b88fa 100644
+--- a/include/core/callbacks.h
++++ b/include/core/callbacks.h
+@@ -115,6 +115,13 @@ void cleanup_pcap_queue(void);
+ void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len, pcap_capture_type_t cap_type);
+ void enqueue_pcap_write(const uint8_t *payload, uint16_t len);
+ 
++// Creates the writer task/queue/pool if not already running. Called lazily
++// from enqueue_pcap_write*() (see there), and should also be called
++// proactively by any capture-start path (pcap_init() already does this)
++// before it enables a WiFi/BLE/etc. RX callback that might call
++// enqueue_pcap_write*() - see callbacks.c for why.
++void ensure_pcap_queue_started(void);
++
+ // Handshake tracking helpers used by adaptive capture UIs.
+ uint32_t wifi_callbacks_get_handshake_count(void);
+ void wifi_callbacks_reset_handshake_tracking(void);
+diff --git a/main/managers/ble_manager.c b/main/managers/ble_manager.c
+index a82e020..754a992 100644
+--- a/main/managers/ble_manager.c
++++ b/main/managers/ble_manager.c
+@@ -97,7 +97,12 @@ static bool ble_wait_for_scan_stop(uint32_t timeout_ms);
+ static bool ble_wait_for_callbacks_idle(uint32_t timeout_ms);
+ static void pcap_flush_timer_cb(void *arg) {
+     (void)arg;
+-    (void)pcap_flush_buffer_to_file();
++    // No longer flushes to the SD-backed file: this timer fires every 1s (or
++    // 200ms for skimmer/airtag scans) while BLE RX is still active, and
++    // that's what was panicking the device. All flushing is now deferred to
++    // capture stop - the existing "Final flush" calls (ble_stop_skimmer_detection(),
++    // etc.) already do that. Timer left running (harmless no-op) rather than
++    // removing its create/start/stop lifecycle elsewhere in this file.
+ }
+ 
+ static bool ble_wait_for_scan_stop(uint32_t timeout_ms) {
