@@ -5,13 +5,17 @@ FAT storage) to [GhostESP](https://github.com/GhostESP-Revival/GhostESP) for
 boards that have no physical SD slot — starting with a plain ESP32-S3
 DevKitC-1-style board (16MB flash, 8MB PSRAM). **Status: compiled, flashed to
 real hardware, and verified over serial** — see `04-hardware-verification.md`
-for the full result. Four patches, applied in order: `01` (static
+for the full result. Five patches, applied in order: `01` (static
 partition), `02` (dynamic sizing), `03` (a one-file fix required to compile
 `02` against ESP-IDF v6.1 — see `03-fix-mbedtls-md5-idf61-NOTES.md`), `05`
 (fixes a device panic that mounting this virtual SD exposes in GhostESP's
 own pcap capture code — see `05-fix-pcap-callback-stack-overflow-NOTES.md`;
 unrelated to the storage partition itself, independent of `02`/`03`, but
-only surfaces once SD is actually mounted for capture to write to).
+only surfaces once SD is actually mounted for capture to write to), `06`
+(fixes the `sd vstorage resize/create/delete` abort() that `02`'s own notes
+flagged as unverified and risky — see
+`06-fix-vstorage-resize-abort-NOTES.md`; layered on `02` directly, since
+it's the commit-the-new-partition-table step `02` added that was aborting).
 
 ## Why
 
@@ -110,11 +114,17 @@ full root-cause writeup.
   numbers. A manual `sd write` / `sd cat` round trip through the mounted
   virtual storage was also confirmed working. Full detail and exact serial
   output in `04-hardware-verification.md`.
-- **Still unverified**: the partition-table *resize* path (`sd vstorage
-  create|resize|delete` — writing a new partition table to a running device
-  and surviving the required reboot). That's the genuinely risky part
-  flagged in `02-dynamic-sizing-NOTES.md`, and it hasn't been exercised on
-  hardware yet.
+- **Update**: the partition-table *resize* path (`sd vstorage
+  create|resize|delete`) — the genuinely risky part flagged above and in
+  `02-dynamic-sizing-NOTES.md` — has since been exercised on hardware, in a
+  separate session: `sd vstorage resize 5 -y` reliably `abort()`s the device
+  (cleanly recovers on reboot, live table left untouched) because the commit
+  write lands in esp_flash's protected-region guard
+  (`CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS=y` in this build). Root-caused
+  and fixed in `06-fix-vstorage-resize-abort.patch` — see
+  `06-fix-vstorage-resize-abort-NOTES.md`. That patch is build-verified only;
+  the actual resize has not yet been re-run on hardware with the fix
+  applied.
 
 ## Applying
 
@@ -126,10 +136,12 @@ git apply /path/to/01-static-partition.patch
 git apply /path/to/02-dynamic-sizing.patch
 git apply /path/to/03-fix-mbedtls-md5-idf61.patch   # required for ESP-IDF v6.1
 git apply /path/to/05-fix-pcap-callback-stack-overflow.patch   # capture + SD mounted panics without this
+git apply /path/to/06-fix-vstorage-resize-abort.patch          # sd vstorage resize/create/delete aborts without this
 # then build configs/sdkconfig.generic_esp32s3_16mb via GBT / idf.py
 ```
 
 See `04-hardware-verification.md` for the build/flash/serial-verification
 results and the exact `sd` commands used to test read/write. See
-`05-fix-pcap-callback-stack-overflow-NOTES.md` for the capture-crash fix —
+`05-fix-pcap-callback-stack-overflow-NOTES.md` and
+`06-fix-vstorage-resize-abort-NOTES.md` for the two crash fixes — both
 build-verified only, not yet flashed/re-tested on hardware.
