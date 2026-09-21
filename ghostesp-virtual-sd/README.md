@@ -17,12 +17,15 @@ abort() that `02`'s own notes flagged as unverified and risky — see
 it's the commit-the-new-partition-table step `02` added that was aborting),
 `07` (the fix that actually resolved the capture-panic `05` attempted twice
 and didn't — see `07-defer-capture-writes-to-stop-NOTES.md`. **Hardware-verified**,
-unlike `05`'s two attempts). A follow-up verification pass (`08-pcap-capture-verification.md`,
-no patch of its own) confirms `-raw` capture also works on the `07`-fixed
-firmware, and goes one step further than `07`'s own testing by parsing the
-resulting `.pcap` file's bytes directly (magic number, header fields, a
-real decoded 802.11 beacon frame) rather than just checking size/packet
-count.
+unlike `05`'s two attempts). Two follow-up verification passes (no patches
+of their own): `08-pcap-capture-verification.md` confirms `-raw` capture
+also works on the `07`-fixed firmware, parsing the resulting `.pcap`
+file's bytes directly (magic number, header fields, a real decoded 802.11
+beacon frame) rather than just checking size/packet count; and
+`09-resize-and-capture-retest.md` flashes `06`'s resize fix to hardware
+for the first time and confirms `sd vstorage resize 5 -y` no longer
+aborts, then re-confirms capture still works on the resized, reformatted
+partition.
 
 ## Why
 
@@ -129,9 +132,11 @@ full root-cause writeup.
   write lands in esp_flash's protected-region guard
   (`CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS=y` in this build). Root-caused
   and fixed in `06-fix-vstorage-resize-abort.patch` — see
-  `06-fix-vstorage-resize-abort-NOTES.md`. That patch is build-verified only;
-  the actual resize has not yet been re-run on hardware with the fix
-  applied.
+  `06-fix-vstorage-resize-abort-NOTES.md`. **Update**: since re-flashed and
+  re-tested on real hardware — `sd vstorage resize 5 -y` now completes
+  cleanly with no `abort()`, the new 5MB size takes effect after reboot,
+  and the resized partition is fully read/write functional. See
+  `09-resize-and-capture-retest.md`.
 - **Update**: the capture-panic-with-SD-mounted bug `05` attempted to fix
   (twice, see above) is now actually fixed and **hardware-verified** —
   `07-defer-capture-writes-to-stop.patch`. `capture -probe` (20s and 30s
@@ -146,6 +151,13 @@ full root-cause writeup.
   correct pcap magic number, correct global-header fields, correct
   `LINKTYPE_IEEE802_11_RADIOTAP`, and a real decoded 802.11 beacon frame as
   the first record. See `08-pcap-capture-verification.md`.
+- **Update**: after the resize fix (`06`) was flashed and hardware-tested
+  (see above), capture was re-run on the resized/reformatted partition to
+  confirm it wasn't affected by the partition change — `capture -raw`,
+  zero crashes, `seen=1759 written=1759 dropped=0`, resulting `.pcap`
+  parsed clean (same checks as `08`). Resize and capture are now both
+  confirmed working independently *and* together, in sequence, on the
+  same flash. See `09-resize-and-capture-retest.md`.
 
 ## Applying
 
