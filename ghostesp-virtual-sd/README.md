@@ -17,7 +17,12 @@ abort() that `02`'s own notes flagged as unverified and risky — see
 it's the commit-the-new-partition-table step `02` added that was aborting),
 `07` (the fix that actually resolved the capture-panic `05` attempted twice
 and didn't — see `07-defer-capture-writes-to-stop-NOTES.md`. **Hardware-verified**,
-unlike `05`'s two attempts).
+unlike `05`'s two attempts). A follow-up verification pass (`08-pcap-capture-verification.md`,
+no patch of its own) confirms `-raw` capture also works on the `07`-fixed
+firmware, and goes one step further than `07`'s own testing by parsing the
+resulting `.pcap` file's bytes directly (magic number, header fields, a
+real decoded 802.11 beacon frame) rather than just checking size/packet
+count.
 
 ## Why
 
@@ -135,6 +140,12 @@ full root-cause writeup.
   See `07-defer-capture-writes-to-stop-NOTES.md` for what actually worked
   (deferring all SD writes to capture-stop, not the stack/timing fixes `05`
   tried first) and why the earlier attempts didn't.
+- **Update**: `capture -raw` also confirmed working on the `07`-fixed
+  firmware — `sd info` showed a 450,386-byte `.pcap`, and this time the
+  bytes themselves were pulled back and parsed (not just the size):
+  correct pcap magic number, correct global-header fields, correct
+  `LINKTYPE_IEEE802_11_RADIOTAP`, and a real decoded 802.11 beacon frame as
+  the first record. See `08-pcap-capture-verification.md`.
 
 ## Applying
 
