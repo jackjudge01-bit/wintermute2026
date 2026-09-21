@@ -25,7 +25,10 @@ beacon frame) rather than just checking size/packet count; and
 `09-resize-and-capture-retest.md` flashes `06`'s resize fix to hardware
 for the first time and confirms `sd vstorage resize 5 -y` no longer
 aborts, then re-confirms capture still works on the resized, reformatted
-partition.
+partition; `10-create-delete-verification.md` closes out the last
+untested corner of `06` by hardware-verifying `create` and `delete` too —
+all three `sd vstorage` operations are now individually confirmed working
+on real hardware.
 
 ## Why
 
@@ -158,6 +161,14 @@ full root-cause writeup.
   parsed clean (same checks as `08`). Resize and capture are now both
   confirmed working independently *and* together, in sequence, on the
   same flash. See `09-resize-and-capture-retest.md`.
+- **Update**: `sd vstorage create` and `sd vstorage delete` — the last
+  untested corner of the `06` fix — are now also hardware-verified.
+  `delete -y` on an existing partition, then `create 4` on the resulting
+  empty state: no `abort()` in either, correct partition-table state after
+  each reboot (`storage_exists=false` then `true` at the right size), and
+  a working read/write filesystem after the `create`. All three `sd
+  vstorage` operations (`create`, `resize`, `delete`) are now individually
+  confirmed working on real hardware. See `10-create-delete-verification.md`.
 
 ## Applying
 
