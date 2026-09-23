@@ -1,6 +1,6 @@
 ---
 name: hackrf-portapack-control
-description: Drive a HackRF One + PortaPack running Mayhem firmware over its official USB serial console - launch any of its ~93-98 on-device apps (RX/TX/utility), read radio/system state, and know what each app does via the bundled catalog. Use this whenever the user wants to control, query, or launch something on the PortaPack/Mayhem device, asks what RF tools/apps are available on the HackRF, or mentions the HackRF/PortaPack by name in the context of doing something with it (not just analyzing an already-captured file - see hackrf_recon.py for that separate, unrelated post-processing tool).
+description: Drive a HackRF One + PortaPack running Mayhem firmware over its official USB serial console - launch any of its ~118 cataloged on-device apps (RX/TX/utility), read radio/system state, and know what each app does via the bundled catalog. Use this whenever the user wants to control, query, or launch something on the PortaPack/Mayhem device, asks what RF tools/apps are available on the HackRF, or mentions the HackRF/PortaPack by name in the context of doing something with it (not just analyzing an already-captured file - see hackrf_recon.py for that separate, unrelated post-processing tool).
 trigger:
   - control the PortaPack
   - launch a Mayhem app
@@ -71,16 +71,35 @@ Or from a shell for one-off commands: `python3 portapack_control.py --port /dev/
   baud - fixed to 4.0s in the driver. If you're calling `send("applist")`
   directly instead of the `applist()` wrapper, use a wait of at least 4s.
 - **The static catalog and the live device don't perfectly agree.**
-  Cross-checked live `applist` output against `mayhem_apps.json`:
-  5 catalog entries weren't confirmed live in one pass (`digitalrain`,
-  `foxhunt`, `morse_tx`, `pacman`, `wav_view` - at least one of these,
-  `foxhunt`, looks like a stale name for what the live device calls
-  `foxhunt_rx`, not a genuinely missing app), and the live device has at
-  least one app (`lookingglass`) the catalog file doesn't list at all.
-  Treat the catalog as a very good reference, not ground truth on its
-  own - if `appstart` on a catalog-listed id fails, check the live
-  `applist()` output for the actual current id before assuming the app
-  doesn't exist.
+  As of 2026-09-23, `mayhem_apps.json` has 118 ids, up from 98 the pass
+  before (added: `recon`, `capture`, `replay`, `lookingglass`, `audio`,
+  `blerx`, `pocsag`, `radiosonde`, `search`, `subghzd`, `weather`,
+  `bletx`, `ooktx`, `rdstx`, `touchtune`, `microphone`, `filemanager`,
+  `freqman`, `iqtrim`, `notepad` - all cross-checked against the official
+  wiki app-name list and all already had prose descriptions in
+  `mayhem_catalog.txt`, they just hadn't been added to the JSON id map
+  yet). **That pass could NOT reach the live device directly** - it was
+  stuck enumerated as USB PID `0x6089` (passthrough) the whole time, so
+  the 20 ids came from re-parsing a genuine prior `applist` capture saved
+  at `~/projects/hackrf-ops/tools/device_dump/applist.txt` (dated
+  2026-09-19, this device), fixing the same multi-app-per-line merging
+  problem described below by hand instead of trusting that file's literal
+  line breaks.
+  **Still unresolved** (left alone rather than guessed, needs a live
+  `appstart` test to settle): the 2026-09-19 capture's ids for four apps
+  don't match what's already in `mayhem_apps.json` for what looks like
+  the same app - `foxhunt_rx` (capture) vs `foxhunt` (catalog),
+  `view_wav` (capture) vs `wav_view` (catalog), `pacman_app` (capture) vs
+  `pacman` (catalog), `digitalrain_app` (capture) vs `digitalrain`
+  (catalog). Also unresolved: the capture's "Morse TX" line parsed as one
+  app under id `morseradiotx`, while the catalog carries `morse_tx`
+  ("Morse TX") and `morseradiotx` ("Morse Radio TX") as two distinct
+  entries - not clear if both are real. Treat the catalog as a very good
+  reference, not ground truth on its own - if `appstart` on a
+  catalog-listed id fails, check live `applist()` output for the actual
+  current id before assuming the app doesn't exist, and see
+  `mayhem_catalog.txt`'s "2026-09-23 CATALOG PASS" section for the full
+  writeup of what's still open.
 - **`applist()`'s parser has a known blind spot**: it uses the catalog's
   id list to find entry boundaries in the device's packed, delimiter-free
   output (necessary - verified a naive whitespace/regex split
@@ -90,6 +109,67 @@ Or from a shell for one-off commands: `python3 portapack_control.py --port /dev/
   appearing as its own entry or raising an error. It's not lost data,
   just misattributed - if an entry's name looks unexpectedly long or
   garbled, that's likely why.
+
+## Full command reference — not just the wrapped subset
+
+The driver's `send(cmd, wait)` method accepts ANY of these raw, sending
+the string straight to the console — the wrapper methods (`applist`,
+`appstart`, `setfreq`, `radioinfo`, `sysinfo`, `button`, `touch`,
+`keyboard`, `screenshot`) are convenience only, not the limit of what's
+usable. This is the complete list, confirmed live via `help` against the
+actual device (not just the wiki):
+
+**System**: `help` (list commands) · `exit` (shutdown console) · `info`
+(ChibiOS/build details) · `systime` (uptime ms) · `reboot` · `dfu` (DFU
+mode) · `hackrf` (switch to native HackRF firmware - drops the console)
+· `sd_over_usb` · `sysinfo` / `radioinfo` (wrapped) · `getres` /
+`getflash` / `getdevtype` (device identity queries, not individually
+wrapped) · `notif` · `asyncmsg <enable|disable>` (debug log toggle)
+
+**Display**: `screenshot` (saves to SD, wrapped but file-transfer not
+implemented - see below) · `screenframe` / `screenframeshort` (screen
+content as text/hex - not wrapped, use `send()` directly)
+
+**Memory**: `write_memory <addr> <val>` · `read_memory <addr>` ·
+`pmemreset yes` (reset all settings to default - destructive)
+
+**Files** (not wrapped at all yet - use `send()`): `ls <dir>` ·
+`unlink <path>` · `mkdir <path>` · `filesize <path>` · `fopen <path>` ·
+`fseek <pos>` · `fclose` · `ftruncate` · `fsync` · `ftell` ·
+`fread <n>` / `frb <n>` · `fwrite` / `fwb` · `crc32 <path>`. Note:
+`fopen`+`fread`/`frb` was tried live this session to pull a screenshot
+off SD and returned empty despite `fopen` reporting `ok` - there's a
+mode-flag or sequencing detail not yet worked out. Don't assume this path
+works until someone gets it working and updates this note.
+
+**Input simulation**: `button [1-8]` (wrapped, refuses 6/DFU) ·
+`touch <x> <y>` (wrapped) · `keyboard <hex>` (wrapped, driver hex-encodes
+for you) · `accessibility_readall` / `accessibility_readcurr` (list/
+describe on-screen widgets - useful for scripted navigation without
+guessing coordinates)
+
+**Date/time**: `rtcget` · `rtcset <y> <mo> <d> <h> <mi> <s>`
+
+**CPLD**: `cpld_info <hackrf|portapack>` · `cpld_read <device> <sram|eeprom>`
+· `cpld_write <device> <target> <file>` - not used or tested this
+session, handle with care, this touches low-level chip config.
+
+**Apps/simulated sensors**: `applist` / `appstart <id>` (wrapped) ·
+`gotgps <lat> <lon> [alt] [speed] [sats]` · `gotorientation <angle>` ·
+`gotenv <temp> [humidity] [pressure] [light]` · `gotlight <lux>` - feed
+fake sensor data to apps that consume it.
+
+**Config**: `settingsreset yes` (delete all INI settings - destructive)
+· `flash` (flash utility access)
+
+**Protocol TX** (transmits real RF - confirm authorization before use,
+same reasoning as any TX app): `sendpocsag <addr> <msglen> [baud] [type]
+[function] [phase]` · `sendflex` (send FLEX pager message, args not
+captured this session - check `help` output or the wiki page for exact
+syntax before using)
+
+Full official reference:
+https://github.com/portapack-mayhem/mayhem-firmware/wiki/usb-serial-console
 
 ## What this doesn't cover yet
 
