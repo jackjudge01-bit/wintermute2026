@@ -94,6 +94,16 @@ Run them back to back, not concurrently - same single-UART-at-a-time
 reasoning as everything else in this skill tree. Module 1 fully closes
 its serial connection before Module 2 opens its own.
 
+## Pitfall: never reset the serial buffer before a STOP command
+
+Commands that STREAM results while running (e.g. `blescan -adv`) accumulate
+their data in the serial input buffer during the scan. A command helper that
+calls `reset_input_buffer()` before writing the stop command (`blescan -s`)
+discards every result collected during the scan — you get 0 records with no
+error. Send the stop WITHOUT resetting, then read both the buffered and
+newly arriving bytes. (Verified on GhostESP Revival v2.2: wiped a full 10s
+BLE scan; fix restored 23 advertisers.)
+
 ## What comes after this, and why it isn't in this skill
 
 Deauthing a target, capturing the resulting handshake, joining and
